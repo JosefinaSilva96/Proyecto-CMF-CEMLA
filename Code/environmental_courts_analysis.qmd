@@ -1,7 +1,7 @@
 ---
 title: "Environmental Enforcement as a Credit Allocation Mechanism"
 subtitle: "A Staggered Difference-in-Differences Analysis"
-author: "CMF Research Project"
+author: "Josefina Silva Fuentealba"
 date: today
 format:
   html:
@@ -194,10 +194,34 @@ cmf_annual <- cmf_annual |>
 ```{r sma-cases}
 #| label: sma-cases
 
-sma_raw <- read_dta(din("cmf_project_super_intendencia.dta"))
+sma_raw <- read_dta(din("cmf_project_super_intendencia.dta")) |>
+  mutate(year = as.integer(year))  # viene como string, hay que convertir
 
-# Count cases per region-year, then compute lagged log measure
+# Construir regid desde region (string) usando el mismo lookup de arriba
+region_lookup_sma <- tribble(
+  ~region,                                                              ~regid,
+  "Región de Tarapacá",                                                     1L,
+  "Región de Antofagasta",                                                   2L,
+  "Región de Atacama",                                                       3L,
+  "Región de Coquimbo",                                                      4L,
+  "Región de Valparaíso",                                                    5L,
+  "Región del Libertador General Bernardo O'Higgins",                        6L,
+  "Región del Maule",                                                        7L,
+  "Región del Biobío",                                                       8L,
+  "Región de la Araucanía",                                                  9L,
+  "Región de los Lagos",                                                    10L,
+  "Región de Aysén del General Carlos Ibáñez del Campo",                   11L,
+  "Región de Magallanes y la Antártica Chilena",                           12L,
+  "Región Metropolitana",                                                   13L,
+  "Región de Los Ríos",                                                     14L,
+  "Región de Arica y Parinacota",                                           15L,
+  "Región de Ñuble",                                                        16L
+)
+
+# Contar casos por region-year y calcular lrcases (lag log)
 reg_cases <- sma_raw |>
+  left_join(region_lookup_sma, by = "region") |>
+  filter(!is.na(regid)) |>
   group_by(regid, year) |>
   summarise(cases = n(), .groups = "drop") |>
   arrange(regid, year) |>
@@ -205,11 +229,16 @@ reg_cases <- sma_raw |>
   mutate(lrcases = lag(log1p(cases))) |>   # one-year lag, as in paper
   ungroup()
 
+# Merge into annual panel
 cmf_annual <- cmf_annual |>
   left_join(reg_cases |> select(regid, year, lrcases),
             by = c("regid", "year")) |>
   mutate(lrcases = replace_na(lrcases, 0))
+
+cat("SMA cases merged. Regions covered:", n_distinct(reg_cases$regid), "\n")
+cat("Years covered:", paste(range(reg_cases$year, na.rm = TRUE), collapse = "-"), "\n")
 ```
+
 
 ## ENCORE Environmental Impact Scores
 
@@ -236,8 +265,10 @@ df <- cmf_annual |>
   filter(regid != 13, !is.na(regid), !is.na(score_share)) |>
   mutate(
     lnewcred   = log(newcred_cartera),
-    # Winsorise at 1% (both tails)
-    lnewcred_w = Winsorize(lnewcred, probs = c(0.01, 0.99), na.rm = TRUE),
+    # Winsorize at 1% — DescTools syntax uses quantile, not probs
+    lnewcred_w = Winsorize(lnewcred,
+                           quantile(lnewcred, probs = c(0.01, 0.99),
+                                    na.rm = TRUE)),
     # Integer IDs for FE
     bankfirm_id = as.integer(interaction(ins_cod, id, drop = TRUE)),
     IDB         = as.integer(factor(ins_cod)),
@@ -254,11 +285,75 @@ cat("  Regions:         ", n_distinct(df$regid), "\n")
 cat("\nCohort distribution (bank-firm level):\n")
 df |> distinct(bankfirm_id, year_court) |> count(year_court) |> print()
 
-# ── Save cleaned working sample ───────────────────────────────────────────────
+# ── Save cleaned working sample ────────────────────────────────────────────────
 write_rds(df, dout("df_working_sample.rds"))
 write_csv(df, dout("df_working_sample.csv"))
 cat("\nWorking sample saved to:", path_out, "\n")
 ```
+
+
+```{r never-treated}
+#| label: never-treated
+
+
+# ── Define never-treated following the paper's approach ───────────────────────
+# Firms in sectors with score_share < 0.2 are assigned year_court = 0
+# (never-treated) because environmental courts are unlikely to affect
+# sectors with negligible environmental impact.
+df <- df |>
+  mutate(
+    year_court = if_else(score_share < 0.2, 0L, year_court),
+    court      = if_else(score_share < 0.2, 0L, court)
+  )
+
+# ── Fix: year_court must be time-invariant per bankfirm_id ────────────────────
+# Some pairs change region or score_share across years (~2% of sample).
+# We assign the modal (most frequent) year_court value per pair.
+year_court_fixed <- df |>
+  group_by(bankfirm_id) |>
+  summarise(
+    year_court = as.integer(names(which.max(table(year_court)))),
+    .groups = "drop"
+  )
+
+df <- df |>
+  select(-year_court) |>
+  left_join(year_court_fixed, by = "bankfirm_id")
+
+# ── Verify cohort distribution ─────────────────────────────────────────────────
+cat("Cohort distribution after never-treated assignment:\n")
+df |> distinct(bankfirm_id, year_court) |> count(year_court) |> print()
+
+cat("\nNot-yet-treated + never-treated by year:\n")
+df |>
+  mutate(nyt = as.integer(year < year_court | year_court == 0)) |>
+  group_by(year) |>
+  summarise(
+    treated     = sum(court == 1),
+    control     = sum(nyt == 1),
+    pct_control = round(100 * mean(nyt == 1), 1),
+    .groups     = "drop"
+  ) |>
+  print(n = 14)
+
+# ── Build df_cs ready for Callaway-Sant'Anna ───────────────────────────────────
+df_cs <- df |>
+  filter(!is.na(lnewcred_w), !is.na(lrcases), !is.na(score_share)) |>
+  mutate(year_court = as.integer(year_court))
+
+# Final check: no pair should have more than one year_court value
+inconsistent <- df_cs |>
+  group_by(bankfirm_id) |>
+  summarise(n_values = n_distinct(year_court), .groups = "drop") |>
+  filter(n_values > 1) |>
+  nrow()
+
+cat("\nPares con year_court inconsistente después del fix:", inconsistent, "\n")
+cat("df_cs listo para CS —", nrow(df_cs), "obs |",
+    n_distinct(df_cs$bankfirm_id), "bank-firm pairs\n")
+```
+
+
 
 ---
 
@@ -508,16 +603,19 @@ df_cs |>
 #| label: cs-main
 #| cache: true
 
+# ── Correr CS sin covariables ──────────────────────────────────────────────────
+# lrcases es constante dentro de cada región-año → causa matriz singular.
+# Corremos sin xformla primero para verificar identificación base.
 cs_main <- att_gt(
   yname         = "lnewcred_w",
   tname         = "year",
-  idname        = "bankfirm_id",
+  idname        = "rs_id",
   gname         = "year_court",
-  xformla       = ~ lrcases + score_share,
-  data          = df_cs,
+  xformla       = ~ 1,              # sin covariables
+  data          = df_rs_bal,
   control_group = "notyettreated",
-  est_method    = "dr",
-  clustervars   = "IDR",
+  est_method    = "reg",
+  clustervars   = "regid_fixed",
   print_details = FALSE
 )
 
@@ -558,30 +656,154 @@ tibble(
 #| label: cs-subgroups
 #| cache: true
 
+# ── High ENCORE ────────────────────────────────────────────────────────────────
 cs_high <- att_gt(
-  yname = "lnewcred_w", tname = "year", idname = "bankfirm_id",
-  gname = "year_court",
-  xformla = ~ lrcases + score_share,
-  data    = df_cs |> filter(d50_score == 1),
-  control_group = "notyettreated", est_method = "dr",
-  clustervars = "IDR", print_details = FALSE
+  yname         = "lnewcred_w",
+  tname         = "year",
+  idname        = "rs_id",
+  gname         = "year_court",
+  xformla       = ~ 1,
+  data          = df_rs_bal |> filter(score_share >= median(score_share, na.rm = TRUE)),
+  control_group = "notyettreated",
+  est_method    = "reg",
+  clustervars   = "regid_fixed",
+  print_details = FALSE
 )
 
+# ── Low ENCORE ─────────────────────────────────────────────────────────────────
 cs_low <- att_gt(
-  yname = "lnewcred_w", tname = "year", idname = "bankfirm_id",
-  gname = "year_court",
-  xformla = ~ lrcases + score_share,
-  data    = df_cs |> filter(d50_score == 0),
-  control_group = "notyettreated", est_method = "dr",
-  clustervars = "IDR", print_details = FALSE
+  yname         = "lnewcred_w",
+  tname         = "year",
+  idname        = "rs_id",
+  gname         = "year_court",
+  xformla       = ~ 1,
+  data          = df_rs_bal |> filter(score_share < median(score_share, na.rm = TRUE)),
+  control_group = "notyettreated",
+  est_method    = "reg",
+  clustervars   = "regid_fixed",
+  print_details = FALSE
 )
 
-cs_high_dyn <- aggte(cs_high, type = "dynamic", min_e = -3, max_e = 8)
-cs_low_dyn  <- aggte(cs_low,  type = "dynamic", min_e = -3, max_e = 8)
+# ── Aggregate ──────────────────────────────────────────────────────────────────
+cs_high_dyn <- aggte(cs_high, type = "dynamic", min_e = -3, max_e = 6)
+cs_low_dyn  <- aggte(cs_low,  type = "dynamic", min_e = -3, max_e = 6)
 
-cat("High ENCORE — simple ATT:", round(aggte(cs_high, "simple")$overall.att, 4), "\n")
-cat("Low  ENCORE — simple ATT:", round(aggte(cs_low,  "simple")$overall.att, 4), "\n")
+cat("High ENCORE — simple ATT:", 
+    round(aggte(cs_high, "simple")$overall.att, 4), "\n")
+cat("Low  ENCORE — simple ATT:", 
+    round(aggte(cs_low,  "simple")$overall.att, 4), "\n")
 ```
+
+```{r cs-enforcement}
+#| label: cs-enforcement
+#| cache: true
+
+# ── Clasificar regiones por intensidad de enforcement pre-tratamiento ──────────
+# Usamos el promedio de lrcases ANTES de la entrada del tribunal
+# para evitar endogeneidad — la intensidad es pre-determinada
+enforcement_intensity <- df_rs_bal |>
+  filter(year < year_court | year_court == 0) |>
+  group_by(regid_fixed) |>
+  summarise(mean_cases = mean(lrcases, na.rm = TRUE), .groups = "drop") |>
+  mutate(
+    high_enforce = as.integer(mean_cases >= median(mean_cases, na.rm = TRUE))
+  )
+
+cat("Regiones por intensidad de enforcement:\n")
+enforcement_intensity |>
+  mutate(label = if_else(high_enforce == 1, "High enforcement", "Low enforcement")) |>
+  count(label) |> print()
+
+# Merge back
+df_rs_bal <- df_rs_bal |>
+  left_join(enforcement_intensity |> select(regid_fixed, mean_cases, high_enforce),
+            by = "regid_fixed")
+
+# ── CS: regiones con enforcement ALTO ─────────────────────────────────────────
+cs_high_enforce <- att_gt(
+  yname         = "lnewcred_w",
+  tname         = "year",
+  idname        = "rs_id",
+  gname         = "year_court",
+  xformla       = ~ 1,
+  data          = df_rs_bal |> filter(high_enforce == 1),
+  control_group = "notyettreated",
+  est_method    = "reg",
+  clustervars   = "regid_fixed",
+  print_details = FALSE
+)
+
+# ── CS: regiones con enforcement BAJO ─────────────────────────────────────────
+cs_low_enforce <- att_gt(
+  yname         = "lnewcred_w",
+  tname         = "year",
+  idname        = "rs_id",
+  gname         = "year_court",
+  xformla       = ~ 1,
+  data          = df_rs_bal |> filter(high_enforce == 0),
+  control_group = "notyettreated",
+  est_method    = "reg",
+  clustervars   = "regid_fixed",
+  print_details = FALSE
+)
+
+# ── Aggregate ──────────────────────────────────────────────────────────────────
+cs_he_simple <- aggte(cs_high_enforce, type = "simple")
+cs_le_simple <- aggte(cs_low_enforce,  type = "simple")
+
+cs_he_dyn <- aggte(cs_high_enforce, type = "dynamic", min_e = -2, max_e = 2)
+cs_le_dyn <- aggte(cs_low_enforce,  type = "dynamic", min_e = -2, max_e = 2)
+
+cat("\nSimple ATT by enforcement intensity:\n")
+tibble(
+  Group = c("High enforcement", "Low enforcement"),
+  ATT   = round(c(cs_he_simple$overall.att, cs_le_simple$overall.att), 4),
+  SE    = round(c(cs_he_simple$overall.se,  cs_le_simple$overall.se),  4)
+) |>
+  mutate(`95% CI` = sprintf("[%.3f, %.3f]",
+                             ATT - 1.96 * SE,
+                             ATT + 1.96 * SE)) |>
+  print()
+
+# ── Event study plot ───────────────────────────────────────────────────────────
+tidy_cs <- function(cs_dyn, label) {
+  tibble(
+    event_time = cs_dyn$egt,
+    att        = cs_dyn$att.egt,
+    se         = cs_dyn$se.egt,
+    group      = label
+  ) |>
+    mutate(ci_lo = att - 1.96 * se,
+           ci_hi = att + 1.96 * se)
+}
+
+es_enforce <- bind_rows(
+  tidy_cs(cs_he_dyn, "High enforcement"),
+  tidy_cs(cs_le_dyn, "Low enforcement")
+)
+
+ggplot(es_enforce, aes(event_time, att, colour = group, fill = group)) +
+  geom_hline(yintercept = 0, linetype = "dashed", colour = "grey50") +
+  geom_vline(xintercept = -0.5, linetype = "dotted", colour = "grey40") +
+  geom_ribbon(aes(ymin = ci_lo, ymax = ci_hi), alpha = 0.15, colour = NA) +
+  geom_line(linewidth = 0.9) +
+  geom_point(size = 2.5) +
+  scale_colour_manual(values = c(col_high, col_low)) +
+  scale_fill_manual(values   = c(col_high, col_low)) +
+  scale_x_continuous(breaks  = -2:2) +
+  facet_wrap(~group, ncol = 2) +
+  labs(
+    title    = "CS Event Study by Pre-Treatment Enforcement Intensity",
+    subtitle = "Replicates Court × Cases logic using region-level enforcement stratification",
+    x        = "Years relative to court introduction",
+    y        = "ATT (log new credit)",
+    colour   = NULL, fill = NULL
+  ) +
+  theme(legend.position = "none")
+
+ggsave(dout("fig_cs_enforcement.png"), width = 10, height = 5, dpi = 150)
+```
+
 
 ---
 
@@ -591,6 +813,7 @@ As an additional robustness check we implement the Wooldridge (2021) **Extended 
 
 ```{r etwfe}
 #| label: etwfe
+
 
 df_w <- df |>
   mutate(
@@ -605,37 +828,65 @@ df_w <- df |>
     f2017 = as.integer(year == 2017),
     f2018 = as.integer(year == 2018),
     f2019 = as.integer(year == 2019),
-    f2020 = as.integer(year == 2020)
-  ) |>
-  # Mean-centre lrcases within each cohort for ATT interpretation
-  group_by(d2013) |>
-  mutate(rc_dm13 = lrcases - mean(lrcases, na.rm = TRUE)) |>
-  group_by(d2014) |>
-  mutate(rc_dm14 = lrcases - mean(lrcases, na.rm = TRUE)) |>
-  group_by(d2017) |>
-  mutate(rc_dm17 = lrcases - mean(lrcases, na.rm = TRUE)) |>
-  ungroup()
+    f2020 = as.integer(year == 2020),
+    # Time-invariant region ID for clustering
+    IDR_fixed = as.integer(factor(regid))
+  )
 
+# ── Mean-centre lrcases within each cohort (correct grouping) ─────────────────
+mean_rc <- df_w |>
+  group_by(year_court) |>
+  summarise(mean_lrcases = mean(lrcases, na.rm = TRUE), .groups = "drop")
+
+df_w <- df_w |>
+  left_join(mean_rc, by = "year_court") |>
+  mutate(
+    rc_dm13 = if_else(d2013 == 1, lrcases - mean_lrcases, 0),
+    rc_dm14 = if_else(d2014 == 1, lrcases - mean_lrcases, 0),
+    rc_dm17 = if_else(d2017 == 1, lrcases - mean_lrcases, 0)
+  ) |>
+  select(-mean_lrcases)
+
+# ── ETWFE: saturated cohort × period × cases interactions ─────────────────────
 etwfe <- feols(
   lnewcred_w ~
-    # Cohort 2013: treatment periods 2013, 2014, 2017
+    # Cohort 2013: post-treatment periods
     I(d2013 * rc_dm13 * f2013) + I(d2013 * rc_dm13 * f2014) +
-    I(d2013 * rc_dm13 * f2017) +
-    # Cohort 2014: treatment periods 2014, 2017
-    I(d2014 * rc_dm14 * f2014) + I(d2014 * rc_dm14 * f2017) +
-    # Cohort 2017: treatment period 2017
-    I(d2017 * rc_dm17 * f2017) |
+    I(d2013 * rc_dm13 * f2015) + I(d2013 * rc_dm13 * f2016) +
+    I(d2013 * rc_dm13 * f2017) + I(d2013 * rc_dm13 * f2018) +
+    I(d2013 * rc_dm13 * f2019) + I(d2013 * rc_dm13 * f2020) +
+    # Cohort 2014: post-treatment periods
+    I(d2014 * rc_dm14 * f2014) + I(d2014 * rc_dm14 * f2015) +
+    I(d2014 * rc_dm14 * f2016) + I(d2014 * rc_dm14 * f2017) +
+    I(d2014 * rc_dm14 * f2018) + I(d2014 * rc_dm14 * f2019) +
+    I(d2014 * rc_dm14 * f2020) +
+    # Cohort 2017: post-treatment periods
+    I(d2017 * rc_dm17 * f2017) + I(d2017 * rc_dm17 * f2018) +
+    I(d2017 * rc_dm17 * f2019) + I(d2017 * rc_dm17 * f2020) |
     bankfirm_id + IDS^year + IDB^year,
   data    = df_w,
-  cluster = ~IDR + IDS
+  cluster = ~IDR_fixed + IDS
 )
 
+# ── Compute weighted average ATT across cohort-period cells ───────────────────
+etwfe_coefs <- coef(etwfe)
+etwfe_coefs <- etwfe_coefs[!is.na(etwfe_coefs)]
+cat("ETWFE — average marginal effect (unweighted mean of cohort-period coefs):\n")
+cat("  Mean =", round(mean(etwfe_coefs), 4), "\n")
+cat("  Range: [", round(min(etwfe_coefs), 4), ",",
+                  round(max(etwfe_coefs), 4), "]\n\n")
+
+# ── Table ──────────────────────────────────────────────────────────────────────
 modelsummary(
   list("ETWFE (Wooldridge 2021)" = etwfe),
   title   = "Robustness: Wooldridge ETWFE with Continuous Treatment",
   stars   = c("*" = 0.1, "**" = 0.05, "***" = 0.01),
   gof_map = c("nobs", "r.squared"),
-  notes   = "Each coefficient is a cohort × period × cases interaction. ATT interpretation requires margins.",
+  notes   = paste(
+    "Each coefficient is a cohort × period × SMA cases interaction.",
+    "lrcases is mean-centred within each treatment cohort.",
+    "Clustered SE by region × sector."
+  ),
   output  = "kableExtra"
 ) |>
   kable_styling(bootstrap_options = c("striped", "condensed"), full_width = FALSE)
@@ -645,33 +896,7 @@ modelsummary(
 
 # Event Study Plots {#sec-event-study}
 
-## TWFE Event Study (Sun-Abraham)
 
-```{r event-twfe}
-#| label: event-twfe
-#| fig-cap: "TWFE event study using Sun & Abraham (2021) via fixest::sunab(). Coefficients represent the interaction between years relative to court introduction and SMA cases."
-
-df_sa <- df |>
-  mutate(
-    # cohort = year_court; 0 for never-treated becomes Inf
-    cohort_sa = if_else(year_court == 0, Inf, as.numeric(year_court))
-  )
-
-sa_model <- feols(
-  lnewcred_w ~ sunab(cohort_sa, year) + lrcases |
-    bankfirm_id + IDS^year + IDB^year,
-  data    = df_sa,
-  cluster = ~IDR + IDS
-)
-
-iplot(sa_model,
-      main   = "Sun-Abraham Event Study",
-      xlab   = "Years relative to court introduction",
-      ylab   = "Coefficient on log new credit",
-      ci_level = 0.95,
-      ref.line = TRUE,
-      ref.line.par = list(col = "grey50", lty = 2))
-```
 
 ## Callaway–Sant'Anna Event Study
 
@@ -699,6 +924,9 @@ es_data <- bind_rows(
   tidy_cs(cs_low_dyn,  "Low ENCORE")
 )
 
+# Breaks dinámicos basados en los event times disponibles
+et_range <- range(es_data$event_time, na.rm = TRUE)
+
 ggplot(es_data, aes(event_time, att, colour = group, fill = group)) +
   geom_hline(yintercept = 0, linetype = "dashed", colour = "grey50") +
   geom_vline(xintercept = -0.5, linetype = "dotted", colour = "grey40") +
@@ -708,7 +936,7 @@ ggplot(es_data, aes(event_time, att, colour = group, fill = group)) +
   scale_colour_manual(values = c(col_high, col_low)) +
   scale_fill_manual(values   = c(col_high, col_low)) +
   scale_shape_manual(values  = c("p<0.05" = 19, "n.s." = 1)) +
-  scale_x_continuous(breaks = -3:8) +
+  scale_x_continuous(breaks  = seq(et_range[1], et_range[2], by = 1)) +
   facet_wrap(~group, ncol = 2) +
   labs(
     title    = "Callaway-Sant'Anna Event Study by ENCORE Subgroup",
@@ -737,10 +965,21 @@ att_gt_df <- tibble(
   mutate(
     ci_lo  = att - 1.96 * se,
     ci_hi  = att + 1.96 * se,
+    sig    = factor(if_else(ci_lo > 0 | ci_hi < 0, "p<0.05", "n.s."),
+                    levels = c("p<0.05", "n.s.")),
+    # Labels dinámicos — solo incluye cohortes que realmente existen
     cohort = factor(g,
-      levels = c(2013, 2014, 2017),
-      labels = c("g=2013  Santiago", "g=2014  Valdivia", "g=2017  Antofagasta"))
+      levels = sort(unique(g)),
+      labels = case_when(
+        sort(unique(g)) == 2013 ~ "g=2013  Santiago",
+        sort(unique(g)) == 2014 ~ "g=2014  Valdivia",
+        sort(unique(g)) == 2017 ~ "g=2017  Antofagasta",
+        TRUE                    ~ paste0("g=", sort(unique(g)))
+      ))
   )
+
+cat("Cohorts in cs_main:", paste(sort(unique(att_gt_df$g)), collapse = ", "), "\n")
+cat("Calendar years covered:", paste(range(att_gt_df$t), collapse = "-"), "\n")
 
 ggplot(att_gt_df, aes(t, att)) +
   geom_hline(yintercept = 0, linetype = "dashed", colour = "grey50") +
@@ -749,17 +988,20 @@ ggplot(att_gt_df, aes(t, att)) +
   geom_ribbon(aes(ymin = ci_lo, ymax = ci_hi),
               fill = col_high, alpha = 0.15) +
   geom_line(colour = col_high, linewidth = 0.9) +
-  geom_point(colour = col_high, size = 2.2) +
-  facet_wrap(~cohort, ncol = 3, scales = "free_x") +
+  geom_point(aes(shape = sig), colour = col_high, size = 2.5) +
+  scale_shape_manual(values = c("p<0.05" = 19, "n.s." = 1)) +
+  facet_wrap(~cohort, ncol = 2, scales = "free_x") +
   scale_x_continuous(breaks = seq(2011, 2024, 2)) +
   labs(
     title    = "ATT(g, t) by Treatment Cohort",
-    subtitle = "Green dotted line = year of court introduction",
+    subtitle = "Green dotted line = year of court introduction | solid points = p<0.05",
     x        = "Calendar year",
-    y        = "ATT(g, t)"
-  )
+    y        = "ATT(g, t)",
+    shape    = NULL
+  ) +
+  theme(legend.position = "bottom")
 
-ggsave(dout("fig5_att_gt_cohorts.png"), width = 11, height = 5, dpi = 150)
+ggsave(dout("fig5_att_gt_cohorts.png"), width = 10, height = 5, dpi = 150)
 ```
 
 ---
@@ -775,14 +1017,26 @@ ggsave(dout("fig5_att_gt_cohorts.png"), width = 11, height = 5, dpi = 150)
 tidy_group <- function(cs_obj, label) {
   g_agg <- aggte(cs_obj, type = "group")
   tibble(
-    cohort = factor(g_agg$egt,
-                    levels = c(2013, 2014, 2017),
-                    labels = c("g=2013", "g=2014", "g=2017")),
+    g      = g_agg$egt,
     att    = g_agg$att.egt,
     se     = g_agg$se.egt,
     group  = label
   ) |>
-    mutate(ci_lo = att - 1.96 * se, ci_hi = att + 1.96 * se)
+    mutate(
+      ci_lo  = att - 1.96 * se,
+      ci_hi  = att + 1.96 * se,
+      sig    = factor(if_else(ci_lo > 0 | ci_hi < 0, "p<0.05", "n.s."),
+                      levels = c("p<0.05", "n.s.")),
+      # Labels dinámicos
+      cohort = factor(g,
+        levels = sort(unique(g)),
+        labels = case_when(
+          sort(unique(g)) == 2013 ~ "g=2013\nSantiago",
+          sort(unique(g)) == 2014 ~ "g=2014\nValdivia",
+          sort(unique(g)) == 2017 ~ "g=2017\nAntofagasta",
+          TRUE                    ~ paste0("g=", sort(unique(g)))
+        ))
+    )
 }
 
 het_data <- bind_rows(
@@ -792,55 +1046,28 @@ het_data <- bind_rows(
 
 ggplot(het_data, aes(cohort, att, colour = group)) +
   geom_hline(yintercept = 0, linetype = "dashed", colour = "grey50") +
-  geom_pointrange(aes(ymin = ci_lo, ymax = ci_hi),
-                  position = position_dodge(0.4), linewidth = 0.9, size = 0.8) +
+  geom_pointrange(
+    aes(ymin = ci_lo, ymax = ci_hi, shape = sig),
+    position  = position_dodge(0.4),
+    linewidth = 0.9,
+    size      = 0.8
+  ) +
   scale_colour_manual(values = c(col_high, col_low)) +
+  scale_shape_manual(values  = c("p<0.05" = 19, "n.s." = 1)) +
   labs(
     title    = "ATT by Cohort and ENCORE Exposure",
-    subtitle = "Point estimates with 95% CI",
+    subtitle = "Point estimates with 95% CI | solid = p<0.05",
     x        = "Treatment cohort",
     y        = "ATT (log new credit)",
-    colour   = NULL
-  )
+    colour   = NULL,
+    shape    = NULL
+  ) +
+  theme(legend.position = "bottom")
 
 ggsave(dout("fig6_het_cohort_encore.png"), width = 8, height = 5, dpi = 150)
 ```
 
-## Goodman-Bacon Decomposition
 
-The decomposition quantifies the weight the TWFE estimator places on each 2×2 comparison. Points above the dashed line are comparisons that push the estimate upward; points below push it downward. Any 2×2 that uses already-treated units as controls is flagged.
-
-```{r bacon-decomp}
-#| label: bacon-decomp
-#| fig-cap: "Goodman-Bacon decomposition. Dashed line = overall TWFE estimate."
-
-bacon_out <- bacon(
-  lnewcred_w ~ court,
-  data      = df |> mutate(court = as.numeric(court)),
-  id_var    = "bankfirm_id",
-  time_var  = "year"
-)
-
-twfe_coef <- weighted.mean(bacon_out$estimate, bacon_out$weight)
-
-ggplot(bacon_out, aes(weight, estimate, colour = type, shape = type)) +
-  geom_hline(yintercept = twfe_coef, linetype = "dashed", colour = "grey40") +
-  geom_point(size = 3, alpha = 0.85) +
-  annotate("text", x = max(bacon_out$weight) * 0.7, y = twfe_coef + 0.03,
-           label = sprintf("TWFE = %.4f", twfe_coef),
-           colour = "grey40", size = 3.5) +
-  scale_colour_brewer(palette = "Set1") +
-  labs(
-    title    = "Goodman-Bacon Decomposition",
-    subtitle = "Each point is a clean 2×2 DiD comparison",
-    x        = "Weight",
-    y        = "2×2 DiD estimate",
-    colour   = "Comparison type",
-    shape    = "Comparison type"
-  )
-
-ggsave(dout("fig7_bacon_decomp.png"), width = 8, height = 5, dpi = 150)
-```
 
 ## Summary Comparison Table
 
