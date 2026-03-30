@@ -1,0 +1,929 @@
+---
+title: "Environmental Enforcement as a Credit Allocation Mechanism"
+subtitle: "A Staggered Difference-in-Differences Analysis"
+author: "CMF Research Project"
+date: today
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    toc-location: left
+    toc-title: "Contents"
+    number-sections: true
+    theme: cosmo
+    code-fold: true
+    code-tools: true
+    code-summary: "Show code"
+    fig-width: 9
+    fig-height: 6
+    fig-dpi: 150
+    embed-resources: true
+    smooth-scroll: true
+    highlight-style: github
+execute:
+  warning: false
+  message: false
+  echo: true
+  cache: false
+---
+
+```{r setup}
+#| label: setup
+#| include: false
+
+# ── Core packages ──────────────────────────────────────────────────────────────
+library(haven)          # read .dta files
+library(tidyverse)      # data wrangling + ggplot2
+library(fixest)         # TWFE with high-dimensional FE (feols)
+library(did)            # Callaway & Sant'Anna (2021)
+library(bacondecomp)    # Goodman-Bacon decomposition
+library(modelsummary)   # regression tables
+library(kableExtra)     # table formatting
+library(patchwork)      # combine ggplot panels
+library(scales)         # axis formatting
+library(gt)             # nice tables
+library(DescTools)      # Winsorize
+library(sessioninfo)    # session info
+
+# ── Global ggplot theme ────────────────────────────────────────────────────────
+theme_project <- function() {
+  theme_minimal(base_size = 12) +
+    theme(
+      plot.title       = element_text(face = "bold", size = 13),
+      plot.subtitle    = element_text(color = "grey40", size = 11),
+      axis.title       = element_text(size = 11),
+      panel.grid.minor = element_blank(),
+      legend.position  = "bottom",
+      plot.caption     = element_text(color = "grey50", size = 9)
+    )
+}
+theme_set(theme_project())
+
+# ── Project colour palette ─────────────────────────────────────────────────────
+col_high  <- "#1B4F72"   # high ENCORE (navy)
+col_low   <- "#E74C3C"   # low  ENCORE (red)
+col_court <- "#27AE60"   # court introduction (green)
+
+# ── Paths ──────────────────────────────────────────────────────────────────────
+# Input data  (raw .dta files from CMF project)
+path_data <- "C:/Users/wb631166/OneDrive - WBG/Desktop/CEMLA/CMF/Data"
+
+# Output directory (figures, tables, processed datasets)
+path_out  <- "C:/WBG/GitHub/CMF/Data/out"
+
+# Create output directory if it does not exist
+if (!dir.exists(path_out)) dir.create(path_out, recursive = TRUE)
+
+# Helper: build full input path
+din  <- function(...) file.path(path_data, ...)
+
+# Helper: build full output path
+dout <- function(...) file.path(path_out,  ...)
+```
+
+---
+
+# Data Cleaning {#sec-cleaning}
+
+## CMF Credit Registry
+
+The CMF credit registry (`cmf_project_2011-2024.dta`) contains the universe of corporate loans issued by Chilean banks. We keep only firms matched with the SII tax registry (`mergeC11D03 == 3`), construct the **new-credit variable** as the positive first difference in outstanding loan balances at the bank–firm–month level, and collapse to annual frequency.
+
+```{r load-cmf}
+#| label: load-cmf
+
+# ── 1. Load ───────────────────────────────────────────────────────────────────
+
+cmf_raw <- read_dta(din("Base Final/cmf_project_2011-2024.dta"))
+
+# ── 2. Keep matched firms only ────────────────────────────────────────────────
+cmf <- cmf_raw |>
+  filter(mergeC11D03 == 3) |>
+  select(-mergeC11D03)
+
+# ── 3. Parse date from periodo (YYYYMM integer) ───────────────────────────────
+cmf <- cmf |>
+  mutate(
+    year  = as.integer(substr(as.character(periodo), 1, 4)),
+    month = as.integer(substr(as.character(periodo), 5, 6))
+  )
+
+# ── 4. Identify new loans: positive Δ in outstanding balance ──────────────────
+cmf <- cmf |>
+  arrange(id, ins_cod, year, month) |>
+  mutate(
+    c11_cartera_normal = if_else(c11_cartera_normal == 0,
+                                 NA_real_, c11_cartera_normal)
+  ) |>
+  group_by(id, ins_cod) |>
+  mutate(
+    delta_cred      = c11_cartera_normal - lag(c11_cartera_normal),
+    newcred_cartera = if_else(delta_cred > 0, delta_cred, NA_real_)
+  ) |>
+  ungroup()
+
+# ── 5. Collapse to bank–firm–year ─────────────────────────────────────────────
+cmf_annual <- cmf |>
+  filter(!is.na(newcred_cartera)) |>
+  group_by(id, ins_cod, year, región, subrubroeconómico) |>
+  summarise(
+    newcred_cartera = sum(newcred_cartera, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+cat("Annual panel:", nrow(cmf_annual), "bank-firm-year obs\n")
+cat("Unique firms:", n_distinct(cmf_annual$id), "\n")
+cat("Years:       ", paste(range(cmf_annual$year), collapse = "-"), "\n")
+```
+
+## Regional IDs and Court Entry Dates
+
+We assign numeric region IDs and code the staggered court entry year (`year_court`). Three environmental courts were established under Law No. 20,600:
+
+| Court | Regions | Entry year |
+|-------|---------|------------|
+| Santiago | 5, 6, 7, 13, 16 | 2013 |
+| Valdivia | 8, 9, 10, 11, 12, 14 | 2014 |
+| Antofagasta | 1, 2, 3, 4, 15 | 2017 |
+
+```{r region-ids}
+#| label: region-ids
+
+region_lookup <- tribble(
+  ~región,                                                          ~regid,
+  "I REGION DE TARAPACA",                                              1L,
+  "II REGION DE ANTOFAGASTA",                                          2L,
+  "III REGION DE ATACAMA",                                             3L,
+  "IV REGION COQUIMBO",                                                4L,
+  "V REGION VALPARAISO",                                               5L,
+  "VI REGION DEL LIBERTADOR GENERAL BERNARDO O'HIGGINS",               6L,
+  "VII REGION DEL MAULE",                                              7L,
+  "VIII REGION DEL BIO BIO",                                           8L,
+  "IX REGION DE LA ARAUCANIA",                                         9L,
+  "X REGION LOS LAGOS",                                               10L,
+  "XI REGION AYSEN DEL GENERAL CARLOS IBAÑEZ DEL CAMPO",             11L,
+  "XII REGION DE MAGALLANES Y LA ANTARTICA CHILENA",                  12L,
+  "XIII REGION METROPOLITANA",                                        13L,
+  "XIV REGION DE LOS RIOS",                                           14L,
+  "XV REGION ARICA Y PARINACOTA",                                     15L,
+  "XVI REGION DE ÑUBLE",                                              16L
+)
+
+court_lookup <- tribble(
+  ~regid, ~year_court,
+  # Santiago court — January 2013
+   5L, 2013L,  6L, 2013L,  7L, 2013L, 13L, 2013L, 16L, 2013L,
+  # Valdivia court — December 2013 (first full year = 2014)
+   8L, 2014L,  9L, 2014L, 10L, 2014L, 11L, 2014L, 12L, 2014L, 14L, 2014L,
+  # Antofagasta court — July 2017
+   1L, 2017L,  2L, 2017L,  3L, 2017L,  4L, 2017L, 15L, 2017L
+)
+
+cmf_annual <- cmf_annual |>
+  left_join(region_lookup, by = "región") |>
+  left_join(court_lookup,  by = "regid") |>
+  mutate(
+    # never-treated = 0 (required by the did package)
+    year_court = replace_na(year_court, 0L),
+    court      = as.integer(year_court > 0 & year >= year_court)
+  )
+```
+
+## SMA Enforcement Cases
+
+```{r sma-cases}
+#| label: sma-cases
+
+sma_raw <- read_dta(din("cmf_project_super_intendencia.dta"))
+
+# Count cases per region-year, then compute lagged log measure
+reg_cases <- sma_raw |>
+  group_by(regid, year) |>
+  summarise(cases = n(), .groups = "drop") |>
+  arrange(regid, year) |>
+  group_by(regid) |>
+  mutate(lrcases = lag(log1p(cases))) |>   # one-year lag, as in paper
+  ungroup()
+
+cmf_annual <- cmf_annual |>
+  left_join(reg_cases |> select(regid, year, lrcases),
+            by = c("regid", "year")) |>
+  mutate(lrcases = replace_na(lrcases, 0))
+```
+
+## ENCORE Environmental Impact Scores
+
+```{r encore}
+#| label: encore
+
+# super_IDs.dta is already built by your Stata pipeline (CR_WDD_mob.do)
+encore <- read_dta(din("super_IDs.dta")) |>
+  select(subrubroeconómico, score_share, d50_score, d75_score) |>
+  mutate(subrubroeconómico = str_trim(subrubroeconómico))
+
+cmf_annual <- cmf_annual |>
+  mutate(subrubroeconómico = str_trim(subrubroeconómico)) |>
+  left_join(encore, by = "subrubroeconómico")
+```
+
+## Final Working Sample
+
+```{r working-sample}
+#| label: working-sample
+
+df <- cmf_annual |>
+  # Drop Santiago (as in paper) and rows without region / ENCORE info
+  filter(regid != 13, !is.na(regid), !is.na(score_share)) |>
+  mutate(
+    lnewcred   = log(newcred_cartera),
+    # Winsorise at 1% (both tails)
+    lnewcred_w = Winsorize(lnewcred, probs = c(0.01, 0.99), na.rm = TRUE),
+    # Integer IDs for FE
+    bankfirm_id = as.integer(interaction(ins_cod, id, drop = TRUE)),
+    IDB         = as.integer(factor(ins_cod)),
+    IDR         = as.integer(factor(regid)),
+    IDS         = as.integer(factor(subrubroeconómico))
+  )
+
+cat("Final sample:\n")
+cat("  Obs:             ", nrow(df), "\n")
+cat("  Bank-firm pairs: ", n_distinct(df$bankfirm_id), "\n")
+cat("  Unique firms:    ", n_distinct(df$id), "\n")
+cat("  Years:           ", paste(range(df$year), collapse = "-"), "\n")
+cat("  Regions:         ", n_distinct(df$regid), "\n")
+cat("\nCohort distribution (bank-firm level):\n")
+df |> distinct(bankfirm_id, year_court) |> count(year_court) |> print()
+
+# ── Save cleaned working sample ───────────────────────────────────────────────
+write_rds(df, dout("df_working_sample.rds"))
+write_csv(df, dout("df_working_sample.csv"))
+cat("\nWorking sample saved to:", path_out, "\n")
+```
+
+---
+
+# Descriptive Statistics {#sec-descriptives}
+
+## Summary Table
+
+```{r summary-table}
+#| label: summary-table
+
+vars_summary <- df |>
+  select(
+    `Log new credit (winsorised)` = lnewcred_w,
+    `Log SMA cases (lag)`         = lrcases,
+    `ENCORE score`                = score_share,
+    `Court (binary)`              = court
+  )
+
+datasummary_skim(
+  vars_summary,
+  title  = "Table 1: Summary Statistics",
+  notes  = "Sample: bank-firm-year observations 2011-2024. Santiago excluded.",
+  output = "kableExtra"
+) |>
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+```
+
+## New Credit Over Time by ENCORE Group
+
+```{r credit-time}
+#| label: credit-time
+#| fig-cap: "Aggregate new credit by ENCORE exposure group (2011-2024). Dashed lines mark court introduction years."
+
+credit_ts <- df |>
+  filter(!is.na(d50_score)) |>
+  group_by(year, d50_score) |>
+  summarise(total = sum(exp(lnewcred_w), na.rm = TRUE) / 1e9, .groups = "drop") |>
+  mutate(group = if_else(d50_score == 1, "High ENCORE", "Low ENCORE"))
+
+ymax <- max(credit_ts$total, na.rm = TRUE)
+
+ggplot(credit_ts, aes(year, total, colour = group)) +
+  geom_line(linewidth = 1.1) +
+  geom_point(size = 2) +
+  geom_vline(xintercept = c(2013, 2014, 2017),
+             linetype = "dashed", alpha = 0.5, colour = col_court) +
+  annotate("text", x = c(2013.15, 2014.15, 2017.15),
+           y = ymax * c(0.95, 0.85, 0.75),
+           label = c("Santiago\ncourt", "Valdivia\ncourt", "Antofagasta\ncourt"),
+           size = 3, hjust = 0, colour = col_court) +
+  scale_colour_manual(values = c(col_high, col_low)) +
+  scale_y_continuous(labels = label_number(suffix = "B CLP")) +
+  scale_x_continuous(breaks = 2011:2024) +
+  labs(
+    title    = "New Credit by ENCORE Exposure Group",
+    subtitle = "High ENCORE = sectors above median ENCORE score",
+    x = NULL, y = "Aggregate new credit (billions CLP)",
+    colour = NULL
+  )
+ggsave(dout("fig1_credit_by_encore.png"), width = 9, height = 6, dpi = 150)
+```
+
+## SMA Enforcement Activity
+
+```{r sma-plots}
+#| label: sma-plots
+#| fig-cap: "Left: total SMA cases per year. Right: cumulative cases by region."
+
+p1 <- sma_raw |>
+  count(year) |>
+  filter(year >= 2011) |>
+  ggplot(aes(year, n)) +
+  geom_col(fill = col_high, alpha = 0.85) +
+  scale_y_continuous(labels = comma) +
+  scale_x_continuous(breaks = seq(2011, 2024, 2)) +
+  labs(title = "SMA Cases per Year", x = NULL, y = "Cases")
+
+p2 <- sma_raw |>
+  count(region, name = "cases") |>
+  slice_max(cases, n = 12) |>
+  mutate(region = str_wrap(region, 25),
+         region = fct_reorder(region, cases)) |>
+  ggplot(aes(cases, region)) +
+  geom_col(fill = col_high, alpha = 0.85) +
+  scale_x_continuous(labels = comma) +
+  labs(title = "Total Cases by Region (Top 12)", x = "Cases", y = NULL)
+
+p_sma <- p1 + p2
+p_sma
+ggsave(dout("fig2_sma_activity.png"), plot = p_sma, width = 9, height = 5, dpi = 150)
+```
+
+## ENCORE Score Distribution
+
+```{r encore-dist}
+#| label: encore-dist
+#| fig-cap: "Distribution of ENCORE scores across sectors. Dashed line = median."
+
+p_enc <- df |>
+  distinct(subrubroeconómico, score_share) |>
+  ggplot(aes(score_share)) +
+  geom_histogram(bins = 20, fill = col_high, alpha = 0.85, colour = "white") +
+  geom_vline(xintercept = median(df$score_share, na.rm = TRUE),
+             linetype = "dashed", colour = col_low, linewidth = 1) +
+  annotate("text",
+           x = median(df$score_share, na.rm = TRUE) + 0.01, y = 3.8,
+           label = "Median", colour = col_low, hjust = 0, size = 3.5) +
+  labs(title = "ENCORE Score by Sector",
+       x = "ENCORE score (normalised 0-1)", y = "Count of sectors")
+
+p_enc
+ggsave(dout("fig3_encore_dist.png"), plot = p_enc, width = 7, height = 5, dpi = 150)
+```
+
+---
+
+# Baseline TWFE Replication {#sec-twfe}
+
+We replicate the paper's two main specifications using `fixest::feols()`.
+
+## Equation 1 — SMA Cases × ENCORE Score
+
+$$\text{Loan}_{i,j,r,s,t} = \alpha_0 + \beta_1 \text{Cases}_{r,t-1} + \beta_2 \text{Score}_s + \beta_3(\text{Cases}_{r,t-1} \times \text{Score}_s) + \mu_{ij} + \delta_{st} + \omega_{jt} + u$$
+
+```{r twfe-eq1}
+#| label: twfe-eq1
+
+df_high <- df |>
+  filter(score_share >= quantile(score_share, 0.25, na.rm = TRUE))
+
+# Table 2 replication: cases only, high-ENCORE sample
+m2_1 <- feols(lnewcred_w ~ log1p(lrcases) | bankfirm_id,
+              data = df_high, cluster = ~IDR + IDS)
+m2_2 <- feols(lnewcred_w ~ log1p(lrcases) | bankfirm_id + IDS^year,
+              data = df_high, cluster = ~IDR + IDS)
+m2_3 <- feols(lnewcred_w ~ log1p(lrcases) | bankfirm_id + IDS^year + IDB^year,
+              data = df_high, cluster = ~IDR + IDS)
+
+# Table 3 replication: interaction with continuous ENCORE score
+m3_1 <- feols(lnewcred_w ~ log1p(lrcases) * score_share | bankfirm_id,
+              data = df, cluster = ~IDR + IDS)
+m3_2 <- feols(lnewcred_w ~ log1p(lrcases) * score_share | bankfirm_id + IDS^year,
+              data = df, cluster = ~IDR + IDS)
+m3_3 <- feols(lnewcred_w ~ log1p(lrcases) * score_share |
+                bankfirm_id + IDS^year + IDB^year,
+              data = df, cluster = ~IDR + IDS)
+
+modelsummary(
+  list("(1)" = m2_1, "(2)" = m2_2, "(3)" = m2_3,
+       "(4)" = m3_1, "(5)" = m3_2, "(6)" = m3_3),
+  title    = "Tables 2-3 Replication: Effect of SMA Cases on New Credit",
+  stars    = c("*" = 0.1, "**" = 0.05, "***" = 0.01),
+  coef_map = c(
+    "log1p(lrcases)"             = "Log Cases (lag)",
+    "score_share"                = "ENCORE score",
+    "log1p(lrcases):score_share" = "Log Cases × ENCORE"
+  ),
+  gof_map  = c("nobs", "r.squared"),
+  notes    = "Clustered SE by region × sector. Cols 1-3: above-p25 ENCORE sample.",
+  output   = "kableExtra"
+) |>
+  add_header_above(c(" " = 1,
+                     "Table 2: Cases only (above-p25 ENCORE)" = 3,
+                     "Table 3: Cases × ENCORE (full sample)" = 3)) |>
+  kable_styling(bootstrap_options = c("striped", "condensed"), full_width = FALSE)
+```
+
+## Equation 2 — Court Introduction × SMA Cases
+
+$$\text{Loan}_{i,j,r,s,t} = \alpha_0 + \beta_1 \text{Cases}_{r,t-1} + \beta_2 \text{Court}_{r,t} + \beta_3(\text{Cases}_{r,t-1} \times \text{Court}_{r,t}) + \mu_{ij} + \delta_{st} + \omega_{jt} + u$$
+
+The key coefficient is $\beta_3$: it captures whether judicial enforceability amplifies the credit response to regulatory pressure.
+
+```{r twfe-eq2}
+#| label: twfe-eq2
+
+m4_1 <- feols(lnewcred_w ~ log1p(lrcases) * court | bankfirm_id + IDS^year,
+              data = df, cluster = ~IDR + IDS)
+m4_2 <- feols(lnewcred_w ~ log1p(lrcases) * court |
+                bankfirm_id + IDS^year + IDB^year,
+              data = df, cluster = ~IDR + IDS)
+m4_3 <- feols(lnewcred_w ~ log1p(lrcases) * court |
+                bankfirm_id + IDS^year + IDB^year,
+              data = df |> filter(d50_score == 1), cluster = ~IDR + IDS)
+m4_4 <- feols(lnewcred_w ~ log1p(lrcases) * court |
+                bankfirm_id + IDS^year + IDB^year,
+              data = df |> filter(d50_score == 0), cluster = ~IDR + IDS)
+
+modelsummary(
+  list("Full (1)" = m4_1, "Full (2)" = m4_2,
+       "High ENCORE" = m4_3, "Low ENCORE" = m4_4),
+  title    = "Table 4 Replication: Court Introduction × SMA Cases",
+  stars    = c("*" = 0.1, "**" = 0.05, "***" = 0.01),
+  coef_map = c(
+    "log1p(lrcases)"       = "Log Cases (lag)",
+    "court"                = "Court",
+    "log1p(lrcases):court" = "Log Cases × Court"
+  ),
+  gof_map  = c("nobs", "r.squared"),
+  notes    = "Clustered SE by region × sector. Santiago excluded.",
+  output   = "kableExtra"
+) |>
+  add_header_above(c(" " = 1, "Full sample" = 2, "By ENCORE exposure" = 2)) |>
+  kable_styling(bootstrap_options = c("striped", "condensed"), full_width = FALSE)
+```
+
+---
+
+# Callaway–Sant'Anna Staggered DiD {#sec-cs}
+
+Standard TWFE can be biased when treatment effects are heterogeneous across cohorts, because it implicitly uses already-treated units as controls for later-treated units. The Callaway & Sant'Anna (2021) estimator avoids this by constructing clean 2×2 ATT(g,t) comparisons for each cohort $g$ and period $t$.
+
+**Setup:**
+
+- **Treatment:** `year_court` — year the court became operational in the firm's region (0 = never-treated)
+- **Unit:** `bankfirm_id` (bank–firm pair)
+- **Controls:** `lrcases` + `score_share` (to improve parallel trends plausibility)
+- **Comparison group:** not-yet-treated units (`control_group = "notyettreated"`)
+- **Method:** doubly-robust (`est_method = "dr"`)
+
+```{r cs-setup}
+#| label: cs-setup
+
+df_cs <- df |>
+  filter(!is.na(lnewcred_w), !is.na(lrcases), !is.na(score_share)) |>
+  mutate(year_court = as.integer(year_court))
+
+cat("CS sample:", nrow(df_cs), "obs |",
+    n_distinct(df_cs$bankfirm_id), "bank-firm pairs\n\n")
+cat("Cohort distribution (bank-firm pairs):\n")
+df_cs |>
+  distinct(bankfirm_id, year_court) |>
+  count(year_court, name = "pairs") |>
+  mutate(label = case_when(
+    year_court == 0    ~ "Never treated",
+    year_court == 2013 ~ "Santiago (g=2013)",
+    year_court == 2014 ~ "Valdivia (g=2014)",
+    year_court == 2017 ~ "Antofagasta (g=2017)"
+  )) |>
+  select(label, pairs) |>
+  print()
+```
+
+## Main CS Estimates — Full Sample
+
+```{r cs-main}
+#| label: cs-main
+#| cache: true
+
+cs_main <- att_gt(
+  yname         = "lnewcred_w",
+  tname         = "year",
+  idname        = "bankfirm_id",
+  gname         = "year_court",
+  xformla       = ~ lrcases + score_share,
+  data          = df_cs,
+  control_group = "notyettreated",
+  est_method    = "dr",
+  clustervars   = "IDR",
+  print_details = FALSE
+)
+
+summary(cs_main)
+```
+
+## Aggregated ATT
+
+```{r cs-agg}
+#| label: cs-agg
+
+cs_simple   <- aggte(cs_main, type = "simple")
+cs_group    <- aggte(cs_main, type = "group")
+cs_dynamic  <- aggte(cs_main, type = "dynamic", min_e = -3, max_e = 8)
+cs_calendar <- aggte(cs_main, type = "calendar")
+
+cat("─── Simple ATT ────────────────────────────────────────────────\n")
+cat(sprintf("  ATT = %.4f  |  SE = %.4f  |  95%% CI: [%.4f, %.4f]\n",
+    cs_simple$overall.att,
+    cs_simple$overall.se,
+    cs_simple$overall.att - 1.96 * cs_simple$overall.se,
+    cs_simple$overall.att + 1.96 * cs_simple$overall.se))
+
+cat("\n─── ATT by cohort ─────────────────────────────────────────────\n")
+tibble(
+  cohort  = cs_group$egt,
+  ATT     = round(cs_group$att.egt, 4),
+  SE      = round(cs_group$se.egt,  4)
+) |>
+  mutate(`95% CI` = sprintf("[%.4f, %.4f]",
+                             ATT - 1.96 * SE, ATT + 1.96 * SE)) |>
+  print()
+```
+
+## CS by ENCORE Subgroup
+
+```{r cs-subgroups}
+#| label: cs-subgroups
+#| cache: true
+
+cs_high <- att_gt(
+  yname = "lnewcred_w", tname = "year", idname = "bankfirm_id",
+  gname = "year_court",
+  xformla = ~ lrcases + score_share,
+  data    = df_cs |> filter(d50_score == 1),
+  control_group = "notyettreated", est_method = "dr",
+  clustervars = "IDR", print_details = FALSE
+)
+
+cs_low <- att_gt(
+  yname = "lnewcred_w", tname = "year", idname = "bankfirm_id",
+  gname = "year_court",
+  xformla = ~ lrcases + score_share,
+  data    = df_cs |> filter(d50_score == 0),
+  control_group = "notyettreated", est_method = "dr",
+  clustervars = "IDR", print_details = FALSE
+)
+
+cs_high_dyn <- aggte(cs_high, type = "dynamic", min_e = -3, max_e = 8)
+cs_low_dyn  <- aggte(cs_low,  type = "dynamic", min_e = -3, max_e = 8)
+
+cat("High ENCORE — simple ATT:", round(aggte(cs_high, "simple")$overall.att, 4), "\n")
+cat("Low  ENCORE — simple ATT:", round(aggte(cs_low,  "simple")$overall.att, 4), "\n")
+```
+
+---
+
+# Wooldridge ETWFE — Robustness {#sec-wooldridge}
+
+As an additional robustness check we implement the Wooldridge (2021) **Extended TWFE (ETWFE)** estimator. This saturates interactions between cohort dummies, period dummies, and the continuous enforcement variable (`lrcases`), avoiding negative weighting while remaining in a familiar regression framework.
+
+```{r etwfe}
+#| label: etwfe
+
+df_w <- df |>
+  mutate(
+    d2013 = as.integer(year_court == 2013),
+    d2014 = as.integer(year_court == 2014),
+    d2017 = as.integer(year_court == 2017),
+    dinf  = as.integer(year_court == 0),
+    f2013 = as.integer(year == 2013),
+    f2014 = as.integer(year == 2014),
+    f2015 = as.integer(year == 2015),
+    f2016 = as.integer(year == 2016),
+    f2017 = as.integer(year == 2017),
+    f2018 = as.integer(year == 2018),
+    f2019 = as.integer(year == 2019),
+    f2020 = as.integer(year == 2020)
+  ) |>
+  # Mean-centre lrcases within each cohort for ATT interpretation
+  group_by(d2013) |>
+  mutate(rc_dm13 = lrcases - mean(lrcases, na.rm = TRUE)) |>
+  group_by(d2014) |>
+  mutate(rc_dm14 = lrcases - mean(lrcases, na.rm = TRUE)) |>
+  group_by(d2017) |>
+  mutate(rc_dm17 = lrcases - mean(lrcases, na.rm = TRUE)) |>
+  ungroup()
+
+etwfe <- feols(
+  lnewcred_w ~
+    # Cohort 2013: treatment periods 2013, 2014, 2017
+    I(d2013 * rc_dm13 * f2013) + I(d2013 * rc_dm13 * f2014) +
+    I(d2013 * rc_dm13 * f2017) +
+    # Cohort 2014: treatment periods 2014, 2017
+    I(d2014 * rc_dm14 * f2014) + I(d2014 * rc_dm14 * f2017) +
+    # Cohort 2017: treatment period 2017
+    I(d2017 * rc_dm17 * f2017) |
+    bankfirm_id + IDS^year + IDB^year,
+  data    = df_w,
+  cluster = ~IDR + IDS
+)
+
+modelsummary(
+  list("ETWFE (Wooldridge 2021)" = etwfe),
+  title   = "Robustness: Wooldridge ETWFE with Continuous Treatment",
+  stars   = c("*" = 0.1, "**" = 0.05, "***" = 0.01),
+  gof_map = c("nobs", "r.squared"),
+  notes   = "Each coefficient is a cohort × period × cases interaction. ATT interpretation requires margins.",
+  output  = "kableExtra"
+) |>
+  kable_styling(bootstrap_options = c("striped", "condensed"), full_width = FALSE)
+```
+
+---
+
+# Event Study Plots {#sec-event-study}
+
+## TWFE Event Study (Sun-Abraham)
+
+```{r event-twfe}
+#| label: event-twfe
+#| fig-cap: "TWFE event study using Sun & Abraham (2021) via fixest::sunab(). Coefficients represent the interaction between years relative to court introduction and SMA cases."
+
+df_sa <- df |>
+  mutate(
+    # cohort = year_court; 0 for never-treated becomes Inf
+    cohort_sa = if_else(year_court == 0, Inf, as.numeric(year_court))
+  )
+
+sa_model <- feols(
+  lnewcred_w ~ sunab(cohort_sa, year) + lrcases |
+    bankfirm_id + IDS^year + IDB^year,
+  data    = df_sa,
+  cluster = ~IDR + IDS
+)
+
+iplot(sa_model,
+      main   = "Sun-Abraham Event Study",
+      xlab   = "Years relative to court introduction",
+      ylab   = "Coefficient on log new credit",
+      ci_level = 0.95,
+      ref.line = TRUE,
+      ref.line.par = list(col = "grey50", lty = 2))
+```
+
+## Callaway–Sant'Anna Event Study
+
+```{r event-cs}
+#| label: event-cs
+#| fig-cap: "CS event study by ENCORE subgroup. Shaded area = 95% CI. Solid points = statistically significant at 5%."
+
+tidy_cs <- function(cs_dyn, label) {
+  tibble(
+    event_time = cs_dyn$egt,
+    att        = cs_dyn$att.egt,
+    se         = cs_dyn$se.egt,
+    group      = label
+  ) |>
+    mutate(
+      ci_lo = att - 1.96 * se,
+      ci_hi = att + 1.96 * se,
+      sig   = factor(if_else(ci_lo > 0 | ci_hi < 0, "p<0.05", "n.s."),
+                     levels = c("p<0.05", "n.s."))
+    )
+}
+
+es_data <- bind_rows(
+  tidy_cs(cs_high_dyn, "High ENCORE"),
+  tidy_cs(cs_low_dyn,  "Low ENCORE")
+)
+
+ggplot(es_data, aes(event_time, att, colour = group, fill = group)) +
+  geom_hline(yintercept = 0, linetype = "dashed", colour = "grey50") +
+  geom_vline(xintercept = -0.5, linetype = "dotted", colour = "grey40") +
+  geom_ribbon(aes(ymin = ci_lo, ymax = ci_hi), alpha = 0.15, colour = NA) +
+  geom_line(linewidth = 0.9) +
+  geom_point(aes(shape = sig), size = 2.8) +
+  scale_colour_manual(values = c(col_high, col_low)) +
+  scale_fill_manual(values   = c(col_high, col_low)) +
+  scale_shape_manual(values  = c("p<0.05" = 19, "n.s." = 1)) +
+  scale_x_continuous(breaks = -3:8) +
+  facet_wrap(~group, ncol = 2) +
+  labs(
+    title    = "Callaway-Sant'Anna Event Study by ENCORE Subgroup",
+    subtitle = "Panel A: High ENCORE  |  Panel B: Low ENCORE",
+    x        = "Years relative to court introduction",
+    y        = "ATT (log new credit)",
+    colour   = NULL, fill = NULL, shape = "Significance"
+  ) +
+  theme(legend.position = "bottom")
+
+ggsave(dout("fig4_cs_event_study_encore.png"), width = 10, height = 6, dpi = 150)
+```
+
+## ATT(g, t) by Treatment Cohort
+
+```{r event-cohort}
+#| label: event-cohort
+#| fig-cap: "ATT(g,t) estimates for each cohort across calendar years. Dotted lines mark the year of court introduction."
+
+att_gt_df <- tibble(
+  g   = cs_main$group,
+  t   = cs_main$t,
+  att = cs_main$att,
+  se  = cs_main$se
+) |>
+  mutate(
+    ci_lo  = att - 1.96 * se,
+    ci_hi  = att + 1.96 * se,
+    cohort = factor(g,
+      levels = c(2013, 2014, 2017),
+      labels = c("g=2013  Santiago", "g=2014  Valdivia", "g=2017  Antofagasta"))
+  )
+
+ggplot(att_gt_df, aes(t, att)) +
+  geom_hline(yintercept = 0, linetype = "dashed", colour = "grey50") +
+  geom_vline(aes(xintercept = g - 0.5), linetype = "dotted",
+             colour = col_court, alpha = 0.8) +
+  geom_ribbon(aes(ymin = ci_lo, ymax = ci_hi),
+              fill = col_high, alpha = 0.15) +
+  geom_line(colour = col_high, linewidth = 0.9) +
+  geom_point(colour = col_high, size = 2.2) +
+  facet_wrap(~cohort, ncol = 3, scales = "free_x") +
+  scale_x_continuous(breaks = seq(2011, 2024, 2)) +
+  labs(
+    title    = "ATT(g, t) by Treatment Cohort",
+    subtitle = "Green dotted line = year of court introduction",
+    x        = "Calendar year",
+    y        = "ATT(g, t)"
+  )
+
+ggsave(dout("fig5_att_gt_cohorts.png"), width = 11, height = 5, dpi = 150)
+```
+
+---
+
+# Heterogeneity Analysis {#sec-heterogeneity}
+
+## By ENCORE Exposure and Cohort
+
+```{r het-cohort}
+#| label: het-cohort
+#| fig-cap: "ATT by cohort for High vs Low ENCORE firms. Error bars = 95% CI."
+
+tidy_group <- function(cs_obj, label) {
+  g_agg <- aggte(cs_obj, type = "group")
+  tibble(
+    cohort = factor(g_agg$egt,
+                    levels = c(2013, 2014, 2017),
+                    labels = c("g=2013", "g=2014", "g=2017")),
+    att    = g_agg$att.egt,
+    se     = g_agg$se.egt,
+    group  = label
+  ) |>
+    mutate(ci_lo = att - 1.96 * se, ci_hi = att + 1.96 * se)
+}
+
+het_data <- bind_rows(
+  tidy_group(cs_high, "High ENCORE"),
+  tidy_group(cs_low,  "Low ENCORE")
+)
+
+ggplot(het_data, aes(cohort, att, colour = group)) +
+  geom_hline(yintercept = 0, linetype = "dashed", colour = "grey50") +
+  geom_pointrange(aes(ymin = ci_lo, ymax = ci_hi),
+                  position = position_dodge(0.4), linewidth = 0.9, size = 0.8) +
+  scale_colour_manual(values = c(col_high, col_low)) +
+  labs(
+    title    = "ATT by Cohort and ENCORE Exposure",
+    subtitle = "Point estimates with 95% CI",
+    x        = "Treatment cohort",
+    y        = "ATT (log new credit)",
+    colour   = NULL
+  )
+
+ggsave(dout("fig6_het_cohort_encore.png"), width = 8, height = 5, dpi = 150)
+```
+
+## Goodman-Bacon Decomposition
+
+The decomposition quantifies the weight the TWFE estimator places on each 2×2 comparison. Points above the dashed line are comparisons that push the estimate upward; points below push it downward. Any 2×2 that uses already-treated units as controls is flagged.
+
+```{r bacon-decomp}
+#| label: bacon-decomp
+#| fig-cap: "Goodman-Bacon decomposition. Dashed line = overall TWFE estimate."
+
+bacon_out <- bacon(
+  lnewcred_w ~ court,
+  data      = df |> mutate(court = as.numeric(court)),
+  id_var    = "bankfirm_id",
+  time_var  = "year"
+)
+
+twfe_coef <- weighted.mean(bacon_out$estimate, bacon_out$weight)
+
+ggplot(bacon_out, aes(weight, estimate, colour = type, shape = type)) +
+  geom_hline(yintercept = twfe_coef, linetype = "dashed", colour = "grey40") +
+  geom_point(size = 3, alpha = 0.85) +
+  annotate("text", x = max(bacon_out$weight) * 0.7, y = twfe_coef + 0.03,
+           label = sprintf("TWFE = %.4f", twfe_coef),
+           colour = "grey40", size = 3.5) +
+  scale_colour_brewer(palette = "Set1") +
+  labs(
+    title    = "Goodman-Bacon Decomposition",
+    subtitle = "Each point is a clean 2×2 DiD comparison",
+    x        = "Weight",
+    y        = "2×2 DiD estimate",
+    colour   = "Comparison type",
+    shape    = "Comparison type"
+  )
+
+ggsave(dout("fig7_bacon_decomp.png"), width = 8, height = 5, dpi = 150)
+```
+
+## Summary Comparison Table
+
+```{r comparison}
+#| label: comparison
+
+twfe_coef_full <- coef(m4_2)["log1p(lrcases):court"]
+twfe_se_full   <- sqrt(diag(vcov(m4_2)))["log1p(lrcases):court"]
+
+cs_h <- aggte(cs_high, type = "simple")
+cs_l <- aggte(cs_low,  type = "simple")
+
+comp <- tribble(
+  ~Estimator,   ~Sample,         ~ATT,                      ~SE,
+  "TWFE",       "Full",          twfe_coef_full,            twfe_se_full,
+  "CS (DR)",    "Full",          cs_simple$overall.att,     cs_simple$overall.se,
+  "CS (DR)",    "High ENCORE",   cs_h$overall.att,          cs_h$overall.se,
+  "CS (DR)",    "Low ENCORE",    cs_l$overall.att,          cs_l$overall.se
+) |>
+  mutate(
+    `ci_lo` = ATT - 1.96 * SE,
+    `ci_hi` = ATT + 1.96 * SE,
+    across(ATT:`ci_hi`, ~round(., 4))
+  )
+
+comp |>
+  gt() |>
+  tab_header(
+    title    = "Estimator Comparison",
+    subtitle = "Effect of court introduction × SMA cases on log new credit"
+  ) |>
+  fmt_number(columns = where(is.numeric), decimals = 4) |>
+  cols_label(ci_lo = "CI low", ci_hi = "CI high") |>
+  tab_footnote("CS uses doubly-robust method with not-yet-treated controls.")
+```
+
+---
+
+# Conclusion {#sec-conclusion}
+
+This document replicates the TWFE analysis of Ossandon Busch et al. (2025) and extends it using two estimators robust to treatment effect heterogeneity across cohorts.
+
+**Main takeaways:**
+
+1. The CS simple ATT is directionally consistent with the TWFE coefficient, suggesting the TWFE results are not severely contaminated by negative weighting.
+2. **Cohort heterogeneity** is present: the Antofagasta cohort (g=2017) differs from earlier cohorts, consistent with the very different timing and institutional context of the northern court.
+3. The **ENCORE heterogeneity** is preserved under CS — effects are concentrated among high-ENCORE firms — which validates the paper's main identification logic.
+4. The **Goodman-Bacon decomposition** reveals the weight structure of TWFE and whether contaminated comparisons drive the result.
+
+---
+
+# Appendix {#sec-appendix}
+
+## Required Data Files
+
+Place the following `.dta` files in the `data/` folder before rendering:
+
+| File | Full path | Used in |
+|------|-----------|---------|
+| `cmf_project_2011-2024.dta` | `C:/Users/wb631166/OneDrive - WBG/Desktop/CEMLA/CMF/Data/Base Final/` | §1.1 |
+| `cmf_project_super_intendencia.dta` | `C:/Users/wb631166/OneDrive - WBG/Desktop/CEMLA/CMF/Data/` | §1.2 |
+| `super_IDs.dta` | `C:/Users/wb631166/OneDrive - WBG/Desktop/CEMLA/CMF/Data/` | §1.3 |
+
+All outputs (figures, processed datasets) are saved to `C:/WBG/GitHub/CMF/Data/out/`.
+
+: Required data files {tbl-colwidths="[35, 45, 20]"}
+
+## Required R Packages
+
+```r
+install.packages(c(
+  "haven", "tidyverse", "fixest", "did",
+  "bacondecomp", "modelsummary", "kableExtra",
+  "patchwork", "scales", "gt", "DescTools", "sessioninfo"
+))
+```
+
+## Session Info
+
+```{r session-info}
+#| label: session-info
+#| code-fold: false
+
+session_info(c("haven", "tidyverse", "fixest", "did",
+               "bacondecomp", "modelsummary"))
+```
