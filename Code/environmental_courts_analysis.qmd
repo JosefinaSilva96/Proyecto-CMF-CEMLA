@@ -93,47 +93,39 @@ The CMF credit registry (`cmf_project_2011-2024.dta`) contains the universe of c
 #| label: load-cmf
 
 # ── 1. Load ───────────────────────────────────────────────────────────────────
-
 cmf_raw <- read_dta(din("Base Final/cmf_project_2011-2024.dta"))
 
 # ── 2. Keep matched firms only ────────────────────────────────────────────────
 cmf <- cmf_raw |>
-  filter(mergeC11D03 == 3) |>
+  filter(mergeC11D03 == 3, c11_cartera_normal > 0) |>
   select(-mergeC11D03)
 
-# ── 3. Parse date from periodo (YYYYMM integer) ───────────────────────────────
+# ── 3. Parse year from periodo (YYYYMM) ───────────────────────────────────────
 cmf <- cmf |>
-  mutate(
-    year  = as.integer(substr(as.character(periodo), 1, 4)),
-    month = as.integer(substr(as.character(periodo), 5, 6))
-  )
+  mutate(year = as.integer(substr(as.character(periodo), 1, 4)))
 
-# ── 4. Identify new loans: positive Δ in outstanding balance ──────────────────
-cmf <- cmf |>
-  arrange(id, ins_cod, year, month) |>
-  mutate(
-    c11_cartera_normal = if_else(c11_cartera_normal == 0,
-                                 NA_real_, c11_cartera_normal)
-  ) |>
-  group_by(id, ins_cod) |>
-  mutate(
-    delta_cred      = c11_cartera_normal - lag(c11_cartera_normal),
-    newcred_cartera = if_else(delta_cred > 0, delta_cred, NA_real_)
-  ) |>
-  ungroup()
-
-# ── 5. Collapse to bank–firm–year ─────────────────────────────────────────────
+# ── 4. Collapse to bank-firm-year using AVERAGE annual balance ────────────────
+# Instead of first-differences (new credit only), we use the average
+# outstanding balance per year. This gives a balanced panel with ~2x
+# more observations and captures both intensive and extensive margins.
 cmf_annual <- cmf |>
-  filter(!is.na(newcred_cartera)) |>
   group_by(id, ins_cod, year, región, subrubroeconómico) |>
   summarise(
-    newcred_cartera = sum(newcred_cartera, na.rm = TRUE),
-    .groups = "drop"
+    avg_cartera  = mean(c11_cartera_normal,          na.rm = TRUE),
+    avg_colat    = mean(c11_deducido_expos_garanreal +
+                        c11_deducido_expos_garfinanc, na.rm = TRUE),
+    avg_cat      = mean(d03_cat_deudor,              na.rm = TRUE),
+    .groups      = "drop"
+  ) |>
+  mutate(
+    # log1p para incluir ceros si los hubiera
+    lnewcred = log1p(avg_cartera)
   )
 
-cat("Annual panel:", nrow(cmf_annual), "bank-firm-year obs\n")
-cat("Unique firms:", n_distinct(cmf_annual$id), "\n")
-cat("Years:       ", paste(range(cmf_annual$year), collapse = "-"), "\n")
+cat("Annual panel (avg balance):\n")
+cat("  Obs:          ", nrow(cmf_annual), "\n")
+cat("  Unique pairs: ", n_distinct(paste(cmf_annual$id, cmf_annual$ins_cod)), "\n")
+cat("  Years:        ", paste(range(cmf_annual$year), collapse = "-"), "\n")
 ```
 
 ## Regional IDs and Court Entry Dates
@@ -258,37 +250,33 @@ cmf_annual <- cmf_annual |>
 ## Final Working Sample
 
 ```{r working-sample}
-#| label: working-sample
-
 df <- cmf_annual |>
-  # Drop Santiago (as in paper) and rows without region / ENCORE info
-  filter(regid != 13, !is.na(regid), !is.na(score_share)) |>
+  filter(!is.na(regid), !is.na(score_share)) |>
+  filter(regid != 13) |>
   mutate(
-    lnewcred   = log(newcred_cartera),
-    # Winsorize at 1% — DescTools syntax uses quantile, not probs
-    lnewcred_w = Winsorize(lnewcred,
-                           quantile(lnewcred, probs = c(0.01, 0.99),
-                                    na.rm = TRUE)),
-    # Integer IDs for FE
+    lnewcred_w  = Winsorize(lnewcred,
+                            quantile(lnewcred, probs = c(0.01, 0.99),
+                                     na.rm = TRUE)),
     bankfirm_id = as.integer(interaction(ins_cod, id, drop = TRUE)),
     IDB         = as.integer(factor(ins_cod)),
     IDR         = as.integer(factor(regid)),
     IDS         = as.integer(factor(subrubroeconómico))
   )
 
-cat("Final sample:\n")
+cat("Final sample (avg balance):\n")
 cat("  Obs:             ", nrow(df), "\n")
 cat("  Bank-firm pairs: ", n_distinct(df$bankfirm_id), "\n")
 cat("  Unique firms:    ", n_distinct(df$id), "\n")
 cat("  Years:           ", paste(range(df$year), collapse = "-"), "\n")
-cat("  Regions:         ", n_distinct(df$regid), "\n")
-cat("\nCohort distribution (bank-firm level):\n")
-df |> distinct(bankfirm_id, year_court) |> count(year_court) |> print()
+cat("  Regions:         ", n_distinct(df$regid), "\n\n")
 
-# ── Save cleaned working sample ────────────────────────────────────────────────
-write_rds(df, dout("df_working_sample.rds"))
-write_csv(df, dout("df_working_sample.csv"))
-cat("\nWorking sample saved to:", path_out, "\n")
+# Balance del panel — clave para decidir si CS es viable
+df |>
+  group_by(bankfirm_id) |>
+  summarise(n_years = n_distinct(year), .groups = "drop") |>
+  count(n_years, name = "pairs") |>
+  mutate(pct = round(100 * pairs / sum(pairs), 1)) |>
+  print(n = 14)
 ```
 
 
@@ -949,6 +937,277 @@ ggplot(es_data, aes(event_time, att, colour = group, fill = group)) +
 
 ggsave(dout("fig4_cs_event_study_encore.png"), width = 10, height = 6, dpi = 150)
 ```
+
+
+```{r event-cohort-cases}
+
+#| label: event-cohort-cases
+#| fig-cap: "Event study by treatment cohort interacted with log SMA cases. Coefficients represent the marginal effect of log SMA cases on log new credit relative to one year before court introduction (τ = -1). Shaded area = 95% CI. Filled markers = significant at 5%."
+
+# ── Reconstruir df_es incluyendo RM ───────────────────────────────────────────
+# A diferencia de df (que excluye regid=13), aquí incluimos la RM
+# porque el tribunal de Santiago cubre la RM y su exclusión
+# puede atenuar el efecto para g=2013
+
+df_es <- cmf_annual |>
+  # Solo excluir filas sin región o sin ENCORE — mantener RM
+  filter(!is.na(regid), !is.na(score_share)) |>
+  mutate(
+    lnewcred    = log(newcred_cartera),
+    lnewcred_w  = Winsorize(lnewcred,
+                            quantile(lnewcred, probs = c(0.01, 0.99),
+                                     na.rm = TRUE)),
+    bankfirm_id = as.integer(interaction(ins_cod, id, drop = TRUE)),
+    IDB         = as.integer(factor(ins_cod)),
+    IDR         = as.integer(factor(regid)),
+    IDS         = as.integer(factor(subrubroeconómico)),
+    IDR_fixed   = as.integer(factor(regid)),
+    # Event time relativo a entrada del tribunal
+    event_time  = if_else(year_court > 0,
+                          as.integer(year - year_court),
+                          NA_integer_),
+    event_time_w = case_when(
+      event_time < -3 ~ -3L,
+      event_time >  6 ~  6L,
+      TRUE            ~ event_time
+    )
+  )
+
+cat("df_es con RM incluida:\n")
+cat("  Obs:    ", nrow(df_es), "\n")
+cat("  Regiones:", n_distinct(df_es$regid), "(incluyendo RM)\n")
+cat("  Cohorte dist:\n")
+df_es |> distinct(bankfirm_id, year_court) |> count(year_court) |> print()
+
+# ── Función estimación ─────────────────────────────────────────────────────────
+run_es_cohort <- function(cohort_year, data) {
+  data |>
+    filter(year_court == cohort_year |
+           year_court == 0           |
+           year_court > cohort_year) |>
+    filter(!is.na(event_time_w) | year_court != cohort_year) |>
+    mutate(
+      event_time_w = replace_na(event_time_w, -1L),
+      event_time_f = relevel(factor(event_time_w), ref = "-1")
+    ) |>
+    feols(
+      lnewcred_w ~ i(event_time_f, lrcases, ref = "-1") |
+        bankfirm_id + IDS^year + IDB^year,
+      data    = _,
+      cluster = ~IDR_fixed + IDS
+    )
+}
+
+# ── Estimar los 3 modelos ──────────────────────────────────────────────────────
+es_2013 <- run_es_cohort(2013, df_es)
+es_2014 <- run_es_cohort(2014, df_es)
+es_2017 <- run_es_cohort(2017, df_es)
+
+# ── Extraer coeficientes ───────────────────────────────────────────────────────
+tidy_es <- function(model, label) {
+  broom::tidy(model, conf.int = TRUE) |>
+    filter(str_detect(term, "event_time_f")) |>
+    mutate(
+      event_time = as.integer(str_extract(term, "-?\\d+")),
+      cohort     = label
+    ) |>
+    select(event_time, estimate, conf.low, conf.high, p.value, cohort) |>
+    bind_rows(
+      tibble(event_time = -1L, estimate = 0,
+             conf.low = 0, conf.high = 0,
+             p.value  = 1, cohort = label)
+    ) |>
+    arrange(event_time) |>
+    mutate(
+      sig_lab = factor(if_else(p.value < 0.05,
+                               "Significant (p<0.05)",
+                               "Insignificant"),
+                       levels = c("Significant (p<0.05)", "Insignificant"))
+    )
+}
+
+es_data <- bind_rows(
+  tidy_es(es_2013, "Panel A: Santiago Court (g = 2013)"),
+  tidy_es(es_2014, "Panel B: Valdivia Court (g = 2014)"),
+  tidy_es(es_2017, "Panel C: Antofagasta Court (g = 2017)")
+) |>
+  mutate(cohort = factor(cohort, levels = c(
+    "Panel A: Santiago Court (g = 2013)",
+    "Panel B: Valdivia Court (g = 2014)",
+    "Panel C: Antofagasta Court (g = 2017)"
+  )))
+
+# ── Plot estilo paper ──────────────────────────────────────────────────────────
+ggplot(es_data, aes(event_time, estimate)) +
+
+  # Zona post-tratamiento sombreada
+  annotate("rect", xmin = -0.5, xmax = Inf,
+           ymin = -Inf, ymax = Inf,
+           fill = "grey90", alpha = 0.3) +
+
+  # Líneas de referencia
+  geom_hline(yintercept = 0,    colour = "black", linewidth = 0.4) +
+  geom_vline(xintercept = -0.5, colour = "black",
+             linewidth  = 0.4,  linetype = "dashed") +
+
+  # CI sombreado
+  geom_ribbon(aes(ymin = conf.low, ymax = conf.high),
+              fill = "grey70", alpha = 0.35, colour = NA) +
+
+  # Línea principal
+  geom_line(colour = "black", linewidth = 0.6) +
+
+  # Puntos: relleno azul si sig, blanco si n.s.
+  geom_point(aes(fill = sig_lab),
+             shape = 21, size = 2.8,
+             colour = "black", stroke = 0.7) +
+  scale_fill_manual(
+    values = c("Significant (p<0.05)" = col_high,
+               "Insignificant"        = "white"),
+    name   = NULL
+  ) +
+
+  scale_x_continuous(breaks = -3:6) +
+  scale_y_continuous(labels = number_format(accuracy = 0.01)) +
+
+  facet_wrap(~cohort, ncol = 3, scales = "fixed") +
+
+  labs(
+    title   = "Dynamic Effects of Environmental Enforcement on New Credit",
+    subtitle = "Interaction: log SMA cases × years relative to court introduction",
+    x       = "Years relative to court introduction (τ)",
+    y       = "Coefficient (log new credit)",
+    caption = paste(
+      "Notes: Each panel estimates a separate TWFE event study for one treatment cohort,",
+      "using not-yet-treated and never-treated units as controls.",
+      "The Santiago cohort (Panel A) includes the Metropolitan Region.",
+      "Reference period τ = −1. Shaded area = 95% CI.",
+      "Filled markers = significant at 5% level.",
+      "FE: bank×firm, sector×year, bank×year.",
+      "SE clustered by region × sector."
+    )
+  ) +
+
+  theme_minimal(base_size = 11) +
+  theme(
+    plot.title       = element_text(face = "bold", size = 13, hjust = 0),
+    plot.subtitle    = element_text(colour = "grey40", size = 10, hjust = 0),
+    plot.caption     = element_text(colour = "grey50", size = 8,
+                                    hjust = 0, margin = margin(t = 8)),
+    strip.text       = element_text(face = "bold", size = 10, hjust = 0,
+                                    margin = margin(b = 4)),
+    strip.background = element_blank(),
+    axis.title       = element_text(size = 10),
+    axis.text        = element_text(size = 9),
+    axis.line        = element_line(colour = "black", linewidth = 0.3),
+    panel.grid.major.x = element_blank(),
+    panel.grid.minor   = element_blank(),
+    panel.grid.major.y = element_line(colour = "grey90", linewidth = 0.3),
+    panel.border     = element_rect(colour = "grey80", fill = NA,
+                                    linewidth = 0.4),
+    legend.position  = "bottom",
+    legend.text      = element_text(size = 9),
+    panel.spacing    = unit(1.2, "lines")
+  )
+
+ggsave(dout("fig_event_cohort_cases.png"),
+       width = 12, height = 5, dpi = 300)
+```
+
+
+```{r event-cohort-cases-encore}
+#| label: event-cohort-cases-encore
+#| fig-cap: "Event study by cohort × log SMA cases, split by ENCORE exposure. Each row is a cohort, each column is High/Low ENCORE."
+
+# ── Función extendida: cohorte × ENCORE ───────────────────────────────────────
+run_es_cohort_encore <- function(cohort_year, encore_label, data) {
+
+  encore_med <- median(data$score_share, na.rm = TRUE)
+
+  df_cohort <- data |>
+    filter(
+      year_court == cohort_year |
+      year_court == 0           |
+      year_court > cohort_year
+    ) |>
+    filter(!is.na(event_time_w) | year_court != cohort_year) |>
+    mutate(
+      encore_group = if_else(score_share >= encore_med,
+                             "High ENCORE", "Low ENCORE"),
+      event_time_w = replace_na(event_time_w, -1L),
+      event_time_f = relevel(factor(event_time_w), ref = "-1")
+    ) |>
+    filter(encore_group == encore_label)
+
+  feols(
+    lnewcred_w ~ i(event_time_f, lrcases, ref = "-1") |
+      bankfirm_id + IDS^year + IDB^year,
+    data    = df_cohort,
+    cluster = ~IDR_fixed + IDS
+  )
+}
+
+# ── Estimar 6 modelos (3 cohortes × 2 grupos ENCORE) ─────────────────────────
+models <- list(
+  list(cohort = 2013, encore = "High ENCORE", label = "g=2013  Santiago"),
+  list(cohort = 2013, encore = "Low ENCORE",  label = "g=2013  Santiago"),
+  list(cohort = 2014, encore = "High ENCORE", label = "g=2014  Valdivia"),
+  list(cohort = 2014, encore = "Low ENCORE",  label = "g=2014  Valdivia"),
+  list(cohort = 2017, encore = "High ENCORE", label = "g=2017  Antofagasta"),
+  list(cohort = 2017, encore = "Low ENCORE",  label = "g=2017  Antofagasta")
+)
+
+results <- map(models, function(m) {
+  fit <- run_es_cohort_encore(m$cohort, m$encore, df_es)
+  tidy_es(fit, m$label) |>
+    mutate(encore_group = m$encore)
+})
+
+es_data_encore <- bind_rows(results) |>
+  mutate(
+    cohort = factor(cohort,
+                    levels = c("g=2013  Santiago",
+                               "g=2014  Valdivia",
+                               "g=2017  Antofagasta")),
+    encore_group = factor(encore_group,
+                          levels = c("High ENCORE", "Low ENCORE"))
+  )
+
+# ── Plot ──────────────────────────────────────────────────────────────────────
+ggplot(es_data_encore, aes(event_time, estimate, colour = encore_group,
+                            fill = encore_group)) +
+  geom_hline(yintercept = 0, linetype = "dashed", colour = "grey50") +
+  geom_vline(xintercept = -0.5, linetype = "dotted",
+             colour = col_court, alpha = 0.8) +
+  geom_ribbon(aes(ymin = conf.low, ymax = conf.high),
+              alpha = 0.12, colour = NA) +
+  geom_line(linewidth = 0.9) +
+  geom_point(aes(shape = sig), size = 2.5) +
+  scale_colour_manual(values = c(col_high, col_low)) +
+  scale_fill_manual(values   = c(col_high, col_low)) +
+  scale_shape_manual(values  = c("p<0.05" = 19, "n.s." = 1)) +
+  scale_x_continuous(breaks  = -3:6) +
+  facet_grid(cohort ~ encore_group) +
+  labs(
+    title    = "Event Study by Cohort × ENCORE Exposure × Log SMA Cases",
+    subtitle = "Rows = treatment cohort | Columns = ENCORE exposure | ref = -1",
+    x        = "Years relative to court introduction",
+    y        = "β (effect of log SMA cases on log new credit)",
+    colour   = NULL, fill = NULL, shape = NULL
+  ) +
+  theme(
+    legend.position  = "bottom",
+    strip.text       = element_text(face = "bold", size = 10),
+    panel.spacing    = unit(1, "lines")
+  )
+
+ggsave(dout("fig_event_cohort_cases_encore.png"),
+       width = 10, height = 10, dpi = 150)
+
+```
+
+
+
 
 ## ATT(g, t) by Treatment Cohort
 
