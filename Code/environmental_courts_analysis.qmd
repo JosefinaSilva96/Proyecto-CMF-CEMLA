@@ -81,7 +81,7 @@ din  <- function(...) file.path(path_data, ...)
 dout <- function(...) file.path(path_out,  ...)
 ```
 
----
+------------------------------------------------------------------------
 
 # Data Cleaning {#sec-cleaning}
 
@@ -104,25 +104,30 @@ cmf <- cmf_raw |>
 cmf <- cmf |>
   mutate(year = as.integer(substr(as.character(periodo), 1, 4)))
 
-# ── 4. Collapse to bank-firm-year using AVERAGE annual balance ────────────────
-# Instead of first-differences (new credit only), we use the average
-# outstanding balance per year. This gives a balanced panel with ~2x
-# more observations and captures both intensive and extensive margins.
+# ── 4. Build bank-firm-year NEW CREDIT flow ───────────────────────────────────
+# New credit is the positive monthly change in outstanding balance.
 cmf_annual <- cmf |>
+  group_by(id, ins_cod) |>
+  arrange(periodo, .by_group = TRUE) |>
+  mutate(
+    newcred_cartera = pmax(c11_cartera_normal - lag(c11_cartera_normal), 0),
+    newcred_cartera = replace_na(newcred_cartera, 0)
+  ) |>
+  ungroup() |>
   group_by(id, ins_cod, year, región, subrubroeconómico) |>
   summarise(
-    avg_cartera  = mean(c11_cartera_normal,          na.rm = TRUE),
-    avg_colat    = mean(c11_deducido_expos_garanreal +
-                        c11_deducido_expos_garfinanc, na.rm = TRUE),
-    avg_cat      = mean(d03_cat_deudor,              na.rm = TRUE),
-    .groups      = "drop"
+    newcred_cartera = sum(newcred_cartera,         na.rm = TRUE),
+    avg_colat       = mean(c11_deducido_expos_garanreal +
+                           c11_deducido_expos_garfinanc, na.rm = TRUE),
+    avg_cat         = mean(d03_cat_deudor,         na.rm = TRUE),
+    .groups         = "drop"
   ) |>
   mutate(
-    # log1p para incluir ceros si los hubiera
-    lnewcred = log1p(avg_cartera)
+    # log1p para incluir ceros
+    lnewcred = log1p(newcred_cartera)
   )
 
-cat("Annual panel (avg balance):\n")
+cat("Annual panel (new credit flow):\n")
 cat("  Obs:          ", nrow(cmf_annual), "\n")
 cat("  Unique pairs: ", n_distinct(paste(cmf_annual$id, cmf_annual$ins_cod)), "\n")
 cat("  Years:        ", paste(range(cmf_annual$year), collapse = "-"), "\n")
@@ -132,11 +137,11 @@ cat("  Years:        ", paste(range(cmf_annual$year), collapse = "-"), "\n")
 
 We assign numeric region IDs and code the staggered court entry year (`year_court`). Three environmental courts were established under Law No. 20,600:
 
-| Court | Regions | Entry year |
-|-------|---------|------------|
-| Santiago | 5, 6, 7, 13, 16 | 2013 |
-| Valdivia | 8, 9, 10, 11, 12, 14 | 2014 |
-| Antofagasta | 1, 2, 3, 4, 15 | 2017 |
+| Court       | Regions              | Entry year |
+|-------------|----------------------|------------|
+| Santiago    | 5, 6, 7, 13, 16      | 2013       |
+| Valdivia    | 8, 9, 10, 11, 12, 14 | 2014       |
+| Antofagasta | 1, 2, 3, 4, 15       | 2017       |
 
 ```{r region-ids}
 #| label: region-ids
@@ -231,7 +236,6 @@ cat("SMA cases merged. Regions covered:", n_distinct(reg_cases$regid), "\n")
 cat("Years covered:", paste(range(reg_cases$year, na.rm = TRUE), collapse = "-"), "\n")
 ```
 
-
 ## ENCORE Environmental Impact Scores
 
 ```{r encore}
@@ -263,7 +267,7 @@ df <- cmf_annual |>
     IDS         = as.integer(factor(subrubroeconómico))
   )
 
-cat("Final sample (avg balance):\n")
+cat("Final sample (new credit flow):\n")
 cat("  Obs:             ", nrow(df), "\n")
 cat("  Bank-firm pairs: ", n_distinct(df$bankfirm_id), "\n")
 cat("  Unique firms:    ", n_distinct(df$id), "\n")
@@ -278,7 +282,6 @@ df |>
   mutate(pct = round(100 * pairs / sum(pairs), 1)) |>
   print(n = 14)
 ```
-
 
 ```{r never-treated}
 #| label: never-treated
@@ -341,9 +344,7 @@ cat("df_cs listo para CS —", nrow(df_cs), "obs |",
     n_distinct(df_cs$bankfirm_id), "bank-firm pairs\n")
 ```
 
-
-
----
+------------------------------------------------------------------------
 
 # Descriptive Statistics {#sec-descriptives}
 
@@ -456,7 +457,7 @@ p_enc
 ggsave(dout("fig3_encore_dist.png"), plot = p_enc, width = 7, height = 5, dpi = 150)
 ```
 
----
+------------------------------------------------------------------------
 
 # Baseline TWFE Replication {#sec-twfe}
 
@@ -474,20 +475,20 @@ df_high <- df |>
 
 # Table 2 replication: cases only, high-ENCORE sample
 m2_1 <- feols(lnewcred_w ~ log1p(lrcases) | bankfirm_id,
-              data = df_high, cluster = ~IDR + IDS)
+              data = df_high, cluster = ~IDR)
 m2_2 <- feols(lnewcred_w ~ log1p(lrcases) | bankfirm_id + IDS^year,
-              data = df_high, cluster = ~IDR + IDS)
+              data = df_high, cluster = ~IDR)
 m2_3 <- feols(lnewcred_w ~ log1p(lrcases) | bankfirm_id + IDS^year + IDB^year,
-              data = df_high, cluster = ~IDR + IDS)
+              data = df_high, cluster = ~IDR)
 
 # Table 3 replication: interaction with continuous ENCORE score
 m3_1 <- feols(lnewcred_w ~ log1p(lrcases) * score_share | bankfirm_id,
-              data = df, cluster = ~IDR + IDS)
+              data = df, cluster = ~IDR)
 m3_2 <- feols(lnewcred_w ~ log1p(lrcases) * score_share | bankfirm_id + IDS^year,
-              data = df, cluster = ~IDR + IDS)
+              data = df, cluster = ~IDR)
 m3_3 <- feols(lnewcred_w ~ log1p(lrcases) * score_share |
                 bankfirm_id + IDS^year + IDB^year,
-              data = df, cluster = ~IDR + IDS)
+              data = df, cluster = ~IDR)
 
 modelsummary(
   list("(1)" = m2_1, "(2)" = m2_2, "(3)" = m2_3,
@@ -500,7 +501,7 @@ modelsummary(
     "log1p(lrcases):score_share" = "Log Cases × ENCORE"
   ),
   gof_map  = c("nobs", "r.squared"),
-  notes    = "Clustered SE by region × sector. Cols 1-3: above-p25 ENCORE sample.",
+  notes    = "Clustered SE by region only. Cols 1-3: above-p25 ENCORE sample.",
   output   = "kableExtra"
 ) |>
   add_header_above(c(" " = 1,
@@ -519,16 +520,16 @@ The key coefficient is $\beta_3$: it captures whether judicial enforceability am
 #| label: twfe-eq2
 
 m4_1 <- feols(lnewcred_w ~ log1p(lrcases) * court | bankfirm_id + IDS^year,
-              data = df, cluster = ~IDR + IDS)
+              data = df, cluster = ~IDR)
 m4_2 <- feols(lnewcred_w ~ log1p(lrcases) * court |
                 bankfirm_id + IDS^year + IDB^year,
-              data = df, cluster = ~IDR + IDS)
+              data = df, cluster = ~IDR)
 m4_3 <- feols(lnewcred_w ~ log1p(lrcases) * court |
                 bankfirm_id + IDS^year + IDB^year,
-              data = df |> filter(d50_score == 1), cluster = ~IDR + IDS)
+              data = df |> filter(d50_score == 1), cluster = ~IDR)
 m4_4 <- feols(lnewcred_w ~ log1p(lrcases) * court |
                 bankfirm_id + IDS^year + IDB^year,
-              data = df |> filter(d50_score == 0), cluster = ~IDR + IDS)
+              data = df |> filter(d50_score == 0), cluster = ~IDR)
 
 modelsummary(
   list("Full (1)" = m4_1, "Full (2)" = m4_2,
@@ -541,14 +542,37 @@ modelsummary(
     "log1p(lrcases):court" = "Log Cases × Court"
   ),
   gof_map  = c("nobs", "r.squared"),
-  notes    = "Clustered SE by region × sector. Santiago excluded.",
+  notes    = "Clustered SE by region only. Santiago excluded.",
   output   = "kableExtra"
 ) |>
   add_header_above(c(" " = 1, "Full sample" = 2, "By ENCORE exposure" = 2)) |>
   kable_styling(bootstrap_options = c("striped", "condensed"), full_width = FALSE)
+
+# Wild cluster bootstrap p-value for the interaction coefficient in m4_2
+m4_2_boot <- feols(
+  lnewcred_w ~ log1p(lrcases) * court |
+    bankfirm_id + IDS^year + IDB^year,
+  data    = df,
+  cluster = ~IDR
+)
+
+if (requireNamespace("wildboottest", quietly = TRUE) && .Platform$OS.type != "windows") {
+  wb_m4_2 <- wildboottest::boottest(
+    m4_2_boot,
+    param   = "log1p(lrcases):court",
+    clustid = "IDR",
+    B       = 9999
+  )
+  print(wb_m4_2)
+} else if (requireNamespace("wildboottest", quietly = TRUE) && .Platform$OS.type == "windows") {
+  cat("wildboottest is installed, but its CLI backend can fail on Windows (TMPDIR command error).\n")
+  cat("Run this block in WSL/Linux or use a Windows-compatible wild bootstrap package.\n")
+} else {
+  cat("wildboottest is not installed. Run install.packages('wildboottest') to compute wild bootstrap p-values.\n")
+}
 ```
 
----
+------------------------------------------------------------------------
 
 # Callaway–Sant'Anna Staggered DiD {#sec-cs}
 
@@ -556,11 +580,11 @@ Standard TWFE can be biased when treatment effects are heterogeneous across coho
 
 **Setup:**
 
-- **Treatment:** `year_court` — year the court became operational in the firm's region (0 = never-treated)
-- **Unit:** `bankfirm_id` (bank–firm pair)
-- **Controls:** `lrcases` + `score_share` (to improve parallel trends plausibility)
-- **Comparison group:** not-yet-treated units (`control_group = "notyettreated"`)
-- **Method:** doubly-robust (`est_method = "dr"`)
+-   **Treatment:** `year_court` — year the court became operational in the firm's region (0 = never-treated)
+-   **Unit:** `bankfirm_id` (bank–firm pair)
+-   **Controls:** `lrcases` + `score_share` (to improve parallel trends plausibility)
+-   **Comparison group:** not-yet-treated units (`control_group = "notyettreated"`)
+-   **Method:** doubly-robust (`est_method = "dr"`)
 
 ```{r cs-setup}
 #| label: cs-setup
@@ -568,6 +592,36 @@ Standard TWFE can be biased when treatment effects are heterogeneous across coho
 df_cs <- df |>
   filter(!is.na(lnewcred_w), !is.na(lrcases), !is.na(score_share)) |>
   mutate(year_court = as.integer(year_court))
+
+# ── Aggregate to region-sector-year level for CS estimation ───────────────────
+# CS requires a unit ID (rs_id) that is time-invariant; bank-firm pairs
+# can move regions, so we collapse to region × sector.
+df_rs_bal <- df_cs |>
+  group_by(regid, subrubroeconómico, year) |>
+  summarise(
+    lnewcred_w  = mean(lnewcred_w,  na.rm = TRUE),
+    lrcases     = first(lrcases),
+    score_share = first(score_share),
+    year_court  = first(year_court),
+    .groups     = "drop"
+  ) |>
+  mutate(
+    rs_id       = as.integer(interaction(regid, subrubroeconómico, drop = TRUE)),
+    regid_fixed = regid
+  )
+
+# ── Fix: year_court must be time-invariant per rs_id ──────────────────────────
+# Assign the modal year_court per region-sector to ensure irreversibility.
+year_court_rs <- df_rs_bal |>
+  group_by(rs_id) |>
+  summarise(
+    year_court = as.integer(names(which.max(table(year_court)))),
+    .groups    = "drop"
+  )
+
+df_rs_bal <- df_rs_bal |>
+  select(-year_court) |>
+  left_join(year_court_rs, by = "rs_id")
 
 cat("CS sample:", nrow(df_cs), "obs |",
     n_distinct(df_cs$bankfirm_id), "bank-firm pairs\n\n")
@@ -636,6 +690,18 @@ tibble(
   mutate(`95% CI` = sprintf("[%.4f, %.4f]",
                              ATT - 1.96 * SE, ATT + 1.96 * SE)) |>
   print()
+
+# ── Helper: tidy a CS dynamic aggregate into a tibble ─────────────────────────
+tidy_cs <- function(cs_dyn, label) {
+  tibble(
+    event_time = cs_dyn$egt,
+    att        = cs_dyn$att.egt,
+    se         = cs_dyn$se.egt,
+    group      = label
+  ) |>
+    mutate(ci_lo = att - 1.96 * se,
+           ci_hi = att + 1.96 * se)
+}
 ```
 
 ## CS by ENCORE Subgroup
@@ -682,7 +748,7 @@ cat("Low  ENCORE — simple ATT:",
     round(aggte(cs_low,  "simple")$overall.att, 4), "\n")
 ```
 
----
+------------------------------------------------------------------------
 
 ## Robustness: Control Group Definition {#sec-robustness-control}
 
@@ -690,9 +756,9 @@ The main CS specification defines the control group as a mix of two types of uni
 
 Three specifications are compared:
 
-- **Baseline**: never-treated (low ENCORE) + not-yet-treated (what the main spec uses)
-- **Robustness A**: only never-treated (low ENCORE firms, `score_share < 0.2`), using `control_group = "nevertreated"` — isolates purely sectoral variation
-- **Robustness B**: only not-yet-treated (geographic timing variation only), panel truncated to 2011–2016 to avoid the absence of controls for g=2017 after all regions are treated
+-   **Baseline**: never-treated (low ENCORE) + not-yet-treated (what the main spec uses)
+-   **Robustness A**: only never-treated (low ENCORE firms, `score_share < 0.2`), using `control_group = "nevertreated"` — isolates purely sectoral variation
+-   **Robustness B**: only not-yet-treated (geographic timing variation only), panel truncated to 2011–2016 to avoid the absence of controls for g=2017 after all regions are treated
 
 ```{r cs-robustness-control}
 #| label: cs-robustness-control
@@ -808,7 +874,7 @@ ggsave(dout("fig_robustness_control_group.png"), width = 10, height = 6, dpi = 1
 
 > **How to read this:** If Robustness A (never-treated only) and Baseline converge but Robustness B diverges, identification is coming primarily from sectoral variation (low ENCORE firms), not geographic timing. If Robustness B fails to run or has very wide CIs, that confirms the g=2017 identification problem: without not-yet-treated units after 2017, the geographic timing variation alone is weak for the Antofagasta cohort.
 
----
+------------------------------------------------------------------------
 
 ```{r cs-enforcement}
 #| label: cs-enforcement
@@ -882,17 +948,6 @@ tibble(
   print()
 
 # ── Event study plot ───────────────────────────────────────────────────────────
-tidy_cs <- function(cs_dyn, label) {
-  tibble(
-    event_time = cs_dyn$egt,
-    att        = cs_dyn$att.egt,
-    se         = cs_dyn$se.egt,
-    group      = label
-  ) |>
-    mutate(ci_lo = att - 1.96 * se,
-           ci_hi = att + 1.96 * se)
-}
-
 es_enforce <- bind_rows(
   tidy_cs(cs_he_dyn, "High enforcement"),
   tidy_cs(cs_le_dyn, "Low enforcement")
@@ -920,8 +975,7 @@ ggplot(es_enforce, aes(event_time, att, colour = group, fill = group)) +
 ggsave(dout("fig_cs_enforcement.png"), width = 10, height = 5, dpi = 150)
 ```
 
-
----
+------------------------------------------------------------------------
 
 # Wooldridge ETWFE — Robustness {#sec-wooldridge}
 
@@ -981,7 +1035,7 @@ etwfe <- feols(
     I(d2017 * rc_dm17 * f2019) + I(d2017 * rc_dm17 * f2020) |
     bankfirm_id + IDS^year + IDB^year,
   data    = df_w,
-  cluster = ~IDR_fixed + IDS
+  cluster = ~IDR_fixed
 )
 
 # ── Compute weighted average ATT across cohort-period cells ───────────────────
@@ -1001,18 +1055,16 @@ modelsummary(
   notes   = paste(
     "Each coefficient is a cohort × period × SMA cases interaction.",
     "lrcases is mean-centred within each treatment cohort.",
-    "Clustered SE by region × sector."
+    "Clustered SE by region only."
   ),
   output  = "kableExtra"
 ) |>
   kable_styling(bootstrap_options = c("striped", "condensed"), full_width = FALSE)
 ```
 
----
+------------------------------------------------------------------------
 
 # Event Study Plots {#sec-event-study}
-
-
 
 ## Callaway–Sant'Anna Event Study
 
@@ -1020,25 +1072,12 @@ modelsummary(
 #| label: event-cs
 #| fig-cap: "CS event study by ENCORE subgroup. Shaded area = 95% CI. Solid points = statistically significant at 5%."
 
-tidy_cs <- function(cs_dyn, label) {
-  tibble(
-    event_time = cs_dyn$egt,
-    att        = cs_dyn$att.egt,
-    se         = cs_dyn$se.egt,
-    group      = label
-  ) |>
-    mutate(
-      ci_lo = att - 1.96 * se,
-      ci_hi = att + 1.96 * se,
-      sig   = factor(if_else(ci_lo > 0 | ci_hi < 0, "p<0.05", "n.s."),
-                     levels = c("p<0.05", "n.s."))
-    )
-}
-
 es_data <- bind_rows(
   tidy_cs(cs_high_dyn, "High ENCORE"),
   tidy_cs(cs_low_dyn,  "Low ENCORE")
-)
+) |>
+  mutate(sig = factor(if_else(ci_lo > 0 | ci_hi < 0, "p<0.05", "n.s."),
+                      levels = c("p<0.05", "n.s.")))
 
 # Breaks dinámicos basados en los event times disponibles
 et_range <- range(es_data$event_time, na.rm = TRUE)
@@ -1066,7 +1105,6 @@ ggplot(es_data, aes(event_time, att, colour = group, fill = group)) +
 ggsave(dout("fig4_cs_event_study_encore.png"), width = 10, height = 6, dpi = 150)
 ```
 
-
 ```{r event-cohort-cases}
 
 #| label: event-cohort-cases
@@ -1081,7 +1119,7 @@ df_es <- cmf_annual |>
   # Solo excluir filas sin región o sin ENCORE — mantener RM
   filter(!is.na(regid), !is.na(score_share)) |>
   mutate(
-    lnewcred    = log(newcred_cartera),
+    lnewcred    = log1p(newcred_cartera),
     lnewcred_w  = Winsorize(lnewcred,
                             quantile(lnewcred, probs = c(0.01, 0.99),
                                      na.rm = TRUE)),
@@ -1122,7 +1160,7 @@ run_es_cohort <- function(cohort_year, data) {
       lnewcred_w ~ i(event_time_f, lrcases, ref = "-1") |
         bankfirm_id + IDS^year + IDB^year,
       data    = _,
-      cluster = ~IDR_fixed + IDS
+      cluster = ~IDR_fixed
     )
 }
 
@@ -1212,7 +1250,7 @@ ggplot(es_data, aes(event_time, estimate)) +
       "Reference period τ = −1. Shaded area = 95% CI.",
       "Filled markers = significant at 5% level.",
       "FE: bank×firm, sector×year, bank×year.",
-      "SE clustered by region × sector."
+      "SE clustered by region only."
     )
   ) +
 
@@ -1242,7 +1280,6 @@ ggsave(dout("fig_event_cohort_cases.png"),
        width = 12, height = 5, dpi = 300)
 ```
 
-
 ```{r event-cohort-cases-encore}
 #| label: event-cohort-cases-encore
 #| fig-cap: "Event study by cohort × log SMA cases, split by ENCORE exposure. Each row is a cohort, each column is High/Low ENCORE."
@@ -1271,7 +1308,7 @@ run_es_cohort_encore <- function(cohort_year, encore_label, data) {
     lnewcred_w ~ i(event_time_f, lrcases, ref = "-1") |
       bankfirm_id + IDS^year + IDB^year,
     data    = df_cohort,
-    cluster = ~IDR_fixed + IDS
+    cluster = ~IDR_fixed
   )
 }
 
@@ -1298,7 +1335,9 @@ es_data_encore <- bind_rows(results) |>
                                "g=2014  Valdivia",
                                "g=2017  Antofagasta")),
     encore_group = factor(encore_group,
-                          levels = c("High ENCORE", "Low ENCORE"))
+                          levels = c("High ENCORE", "Low ENCORE")),
+    sig = factor(if_else(p.value < 0.05, "p<0.05", "n.s."),
+                 levels = c("p<0.05", "n.s."))
   )
 
 # ── Plot ──────────────────────────────────────────────────────────────────────
@@ -1333,9 +1372,6 @@ ggsave(dout("fig_event_cohort_cases_encore.png"),
        width = 10, height = 10, dpi = 150)
 
 ```
-
-
-
 
 ## ATT(g, t) by Treatment Cohort
 
@@ -1391,7 +1427,7 @@ ggplot(att_gt_df, aes(t, att)) +
 ggsave(dout("fig5_att_gt_cohorts.png"), width = 10, height = 5, dpi = 150)
 ```
 
----
+------------------------------------------------------------------------
 
 # Heterogeneity Analysis {#sec-heterogeneity}
 
@@ -1454,8 +1490,6 @@ ggplot(het_data, aes(cohort, att, colour = group)) +
 ggsave(dout("fig6_het_cohort_encore.png"), width = 8, height = 5, dpi = 150)
 ```
 
-
-
 ## Summary Comparison Table
 
 ```{r comparison}
@@ -1491,7 +1525,7 @@ comp |>
   tab_footnote("CS uses doubly-robust method with not-yet-treated controls.")
 ```
 
----
+------------------------------------------------------------------------
 
 # Conclusion {#sec-conclusion}
 
@@ -1499,12 +1533,12 @@ This document replicates the TWFE analysis of Ossandon Busch et al. (2025) and e
 
 **Main takeaways:**
 
-1. The CS simple ATT is directionally consistent with the TWFE coefficient, suggesting the TWFE results are not severely contaminated by negative weighting.
-2. **Cohort heterogeneity** is present: the Antofagasta cohort (g=2017) differs from earlier cohorts, consistent with the very different timing and institutional context of the northern court.
-3. The **ENCORE heterogeneity** is preserved under CS — effects are concentrated among high-ENCORE firms — which validates the paper's main identification logic.
-4. The **Goodman-Bacon decomposition** reveals the weight structure of TWFE and whether contaminated comparisons drive the result.
+1.  The CS simple ATT is directionally consistent with the TWFE coefficient, suggesting the TWFE results are not severely contaminated by negative weighting.
+2.  **Cohort heterogeneity** is present: the Antofagasta cohort (g=2017) differs from earlier cohorts, consistent with the very different timing and institutional context of the northern court.
+3.  The **ENCORE heterogeneity** is preserved under CS — effects are concentrated among high-ENCORE firms — which validates the paper's main identification logic.
+4.  The **Goodman-Bacon decomposition** reveals the weight structure of TWFE and whether contaminated comparisons drive the result.
 
----
+------------------------------------------------------------------------
 
 # Appendix {#sec-appendix}
 
@@ -1513,18 +1547,18 @@ This document replicates the TWFE analysis of Ossandon Busch et al. (2025) and e
 Place the following `.dta` files in the `data/` folder before rendering:
 
 | File | Full path | Used in |
-|------|-----------|---------|
+|------------------|------------------------------|-------------------------|
 | `cmf_project_2011-2024.dta` | `C:/Users/wb631166/OneDrive - WBG/Desktop/CEMLA/CMF/Data/Base Final/` | §1.1 |
 | `cmf_project_super_intendencia.dta` | `C:/Users/wb631166/OneDrive - WBG/Desktop/CEMLA/CMF/Data/` | §1.2 |
 | `super_IDs.dta` | `C:/Users/wb631166/OneDrive - WBG/Desktop/CEMLA/CMF/Data/` | §1.3 |
 
 All outputs (figures, processed datasets) are saved to `C:/WBG/GitHub/CMF/Data/out/`.
 
-: Required data files {tbl-colwidths="[35, 45, 20]"}
+:   Required data files {tbl-colwidths="\[35, 45, 20\]"}
 
 ## Required R Packages
 
-```r
+``` r
 install.packages(c(
   "haven", "tidyverse", "fixest", "did",
   "bacondecomp", "modelsummary", "kableExtra",
