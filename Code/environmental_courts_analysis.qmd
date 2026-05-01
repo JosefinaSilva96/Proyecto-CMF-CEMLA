@@ -81,7 +81,7 @@ din  <- function(...) file.path(path_data, ...)
 dout <- function(...) file.path(path_out,  ...)
 ```
 
-------------------------------------------------------------------------
+---
 
 # Data Cleaning {#sec-cleaning}
 
@@ -132,11 +132,11 @@ cat("  Years:        ", paste(range(cmf_annual$year), collapse = "-"), "\n")
 
 We assign numeric region IDs and code the staggered court entry year (`year_court`). Three environmental courts were established under Law No. 20,600:
 
-| Court       | Regions              | Entry year |
-|-------------|----------------------|------------|
-| Santiago    | 5, 6, 7, 13, 16      | 2013       |
-| Valdivia    | 8, 9, 10, 11, 12, 14 | 2014       |
-| Antofagasta | 1, 2, 3, 4, 15       | 2017       |
+| Court | Regions | Entry year |
+|-------|---------|------------|
+| Santiago | 5, 6, 7, 13, 16 | 2013 |
+| Valdivia | 8, 9, 10, 11, 12, 14 | 2014 |
+| Antofagasta | 1, 2, 3, 4, 15 | 2017 |
 
 ```{r region-ids}
 #| label: region-ids
@@ -231,6 +231,7 @@ cat("SMA cases merged. Regions covered:", n_distinct(reg_cases$regid), "\n")
 cat("Years covered:", paste(range(reg_cases$year, na.rm = TRUE), collapse = "-"), "\n")
 ```
 
+
 ## ENCORE Environmental Impact Scores
 
 ```{r encore}
@@ -277,6 +278,7 @@ df |>
   mutate(pct = round(100 * pairs / sum(pairs), 1)) |>
   print(n = 14)
 ```
+
 
 ```{r never-treated}
 #| label: never-treated
@@ -339,7 +341,9 @@ cat("df_cs listo para CS —", nrow(df_cs), "obs |",
     n_distinct(df_cs$bankfirm_id), "bank-firm pairs\n")
 ```
 
-------------------------------------------------------------------------
+
+
+---
 
 # Descriptive Statistics {#sec-descriptives}
 
@@ -452,7 +456,7 @@ p_enc
 ggsave(dout("fig3_encore_dist.png"), plot = p_enc, width = 7, height = 5, dpi = 150)
 ```
 
-------------------------------------------------------------------------
+---
 
 # Baseline TWFE Replication {#sec-twfe}
 
@@ -544,7 +548,7 @@ modelsummary(
   kable_styling(bootstrap_options = c("striped", "condensed"), full_width = FALSE)
 ```
 
-------------------------------------------------------------------------
+---
 
 # Callaway–Sant'Anna Staggered DiD {#sec-cs}
 
@@ -552,11 +556,11 @@ Standard TWFE can be biased when treatment effects are heterogeneous across coho
 
 **Setup:**
 
--   **Treatment:** `year_court` — year the court became operational in the firm's region (0 = never-treated)
--   **Unit:** `bankfirm_id` (bank–firm pair)
--   **Controls:** `lrcases` + `score_share` (to improve parallel trends plausibility)
--   **Comparison group:** not-yet-treated units (`control_group = "notyettreated"`)
--   **Method:** doubly-robust (`est_method = "dr"`)
+- **Treatment:** `year_court` — year the court became operational in the firm's region (0 = never-treated)
+- **Unit:** `bankfirm_id` (bank–firm pair)
+- **Controls:** `lrcases` + `score_share` (to improve parallel trends plausibility)
+- **Comparison group:** not-yet-treated units (`control_group = "notyettreated"`)
+- **Method:** doubly-robust (`est_method = "dr"`)
 
 ```{r cs-setup}
 #| label: cs-setup
@@ -678,6 +682,134 @@ cat("Low  ENCORE — simple ATT:",
     round(aggte(cs_low,  "simple")$overall.att, 4), "\n")
 ```
 
+---
+
+## Robustness: Control Group Definition {#sec-robustness-control}
+
+The main CS specification defines the control group as a mix of two types of units: (1) firms with `score_share < 0.2` reclassified as never-treated (sector-based exclusion), and (2) firms in regions not yet treated at each calendar year (geographic not-yet-treated). These two groups are conceptually distinct. This section checks whether results are sensitive to which type of control group drives identification.
+
+Three specifications are compared:
+
+- **Baseline**: never-treated (low ENCORE) + not-yet-treated (what the main spec uses)
+- **Robustness A**: only never-treated (low ENCORE firms, `score_share < 0.2`), using `control_group = "nevertreated"` — isolates purely sectoral variation
+- **Robustness B**: only not-yet-treated (geographic timing variation only), panel truncated to 2011–2016 to avoid the absence of controls for g=2017 after all regions are treated
+
+```{r cs-robustness-control}
+#| label: cs-robustness-control
+#| cache: true
+
+# ── Robustness A: solo never-treated (low ENCORE) como control ─────────────────
+# Usa nevertreated en vez de notyettreated — solo variación sectorial
+cs_robA <- att_gt(
+  yname         = "lnewcred_w",
+  tname         = "year",
+  idname        = "rs_id",
+  gname         = "year_court",
+  xformla       = ~ 1,
+  data          = df_rs_bal,
+  control_group = "nevertreated",   # <-- cambio clave respecto al baseline
+  est_method    = "reg",
+  clustervars   = "regid_fixed",
+  print_details = FALSE
+)
+
+# ── Robustness B: solo not-yet-treated (variación geográfica de timing) ────────
+# Excluye las firmas never-treated artificiales (low ENCORE).
+# Trunca el panel a 2011-2016 para evitar que g=2017 quede sin controles
+# válidos una vez que Antofagasta se trata.
+df_robB <- df_rs_bal |>
+  filter(year <= 2016) |>        # antes de que todas las regiones estén tratadas
+  filter(year_court != 0)        # excluye never-treated artificiales (low ENCORE)
+
+cs_robB <- att_gt(
+  yname         = "lnewcred_w",
+  tname         = "year",
+  idname        = "rs_id",
+  gname         = "year_court",
+  xformla       = ~ 1,
+  data          = df_robB,
+  control_group = "notyettreated",
+  est_method    = "reg",
+  clustervars   = "regid_fixed",
+  print_details = FALSE
+)
+
+# ── Agregar ATT simples ────────────────────────────────────────────────────────
+cs_robA_simple <- aggte(cs_robA, type = "simple")
+cs_robB_simple <- aggte(cs_robB, type = "simple")
+
+# ── Tabla comparativa ─────────────────────────────────────────────────────────
+rob_comp <- tribble(
+  ~Specification,                        ~Control_group,                          ~ATT,                       ~SE,
+  "Baseline (main)",                     "Low ENCORE (never) + not-yet-treated",  cs_simple$overall.att,      cs_simple$overall.se,
+  "Robustness A: never-treated only",    "Low ENCORE only (score_share < 0.2)",   cs_robA_simple$overall.att, cs_robA_simple$overall.se,
+  "Robustness B: not-yet-treated only",  "Not-yet-treated only (2011–2016)",       cs_robB_simple$overall.att, cs_robB_simple$overall.se
+) |>
+  mutate(
+    ci_lo = round(ATT - 1.96 * SE, 4),
+    ci_hi = round(ATT + 1.96 * SE, 4),
+    ATT   = round(ATT, 4),
+    SE    = round(SE,  4)
+  )
+
+rob_comp |>
+  gt() |>
+  tab_header(
+    title    = "Robustness: Sensitivity to Control Group Definition",
+    subtitle = "Are CS results driven by how the control group is constructed?"
+  ) |>
+  fmt_number(columns = where(is.numeric), decimals = 4) |>
+  cols_label(
+    Specification = "Specification",
+    Control_group = "Control group",
+    ci_lo         = "CI low",
+    ci_hi         = "CI high"
+  ) |>
+  tab_footnote(
+    "Robustness B truncates panel to 2011–2016 to avoid the complete
+     absence of not-yet-treated units after g=2017 (Antofagasta) is treated.
+     Robustness A uses nevertreated instead of notyettreated in att_gt()."
+  )
+```
+
+```{r cs-robustness-control-plot}
+#| label: cs-robustness-control-plot
+#| fig-cap: "CS event study under three control group definitions. If the lines align, results are not driven by the choice of control group."
+
+cs_robA_dyn <- aggte(cs_robA, type = "dynamic", min_e = -3, max_e = 6)
+cs_robB_dyn <- aggte(cs_robB, type = "dynamic", min_e = -3, max_e = 3)
+
+es_rob <- bind_rows(
+  tidy_cs(cs_dynamic,  "Baseline (never + not-yet-treated)"),
+  tidy_cs(cs_robA_dyn, "Robustness A: never-treated only"),
+  tidy_cs(cs_robB_dyn, "Robustness B: not-yet-treated only (2011–2016)")
+)
+
+ggplot(es_rob, aes(event_time, att, colour = group, fill = group)) +
+  geom_hline(yintercept = 0, linetype = "dashed", colour = "grey50") +
+  geom_vline(xintercept = -0.5, linetype = "dotted", colour = "grey40") +
+  geom_ribbon(aes(ymin = ci_lo, ymax = ci_hi), alpha = 0.12, colour = NA) +
+  geom_line(linewidth = 0.9) +
+  geom_point(size = 2.5) +
+  scale_colour_manual(values = c("#1B4F72", "#E74C3C", "#8E44AD")) +
+  scale_fill_manual(values   = c("#1B4F72", "#E74C3C", "#8E44AD")) +
+  scale_x_continuous(breaks  = -3:8) +
+  labs(
+    title    = "CS Event Study — Robustness to Control Group Definition",
+    subtitle = "Convergence across lines = results not driven by control group choice",
+    x        = "Years relative to court introduction",
+    y        = "ATT (log new credit)",
+    colour   = NULL, fill = NULL
+  ) +
+  theme(legend.position = "bottom")
+
+ggsave(dout("fig_robustness_control_group.png"), width = 10, height = 6, dpi = 150)
+```
+
+> **How to read this:** If Robustness A (never-treated only) and Baseline converge but Robustness B diverges, identification is coming primarily from sectoral variation (low ENCORE firms), not geographic timing. If Robustness B fails to run or has very wide CIs, that confirms the g=2017 identification problem: without not-yet-treated units after 2017, the geographic timing variation alone is weak for the Antofagasta cohort.
+
+---
+
 ```{r cs-enforcement}
 #| label: cs-enforcement
 #| cache: true
@@ -788,7 +920,8 @@ ggplot(es_enforce, aes(event_time, att, colour = group, fill = group)) +
 ggsave(dout("fig_cs_enforcement.png"), width = 10, height = 5, dpi = 150)
 ```
 
-------------------------------------------------------------------------
+
+---
 
 # Wooldridge ETWFE — Robustness {#sec-wooldridge}
 
@@ -875,9 +1008,11 @@ modelsummary(
   kable_styling(bootstrap_options = c("striped", "condensed"), full_width = FALSE)
 ```
 
-------------------------------------------------------------------------
+---
 
 # Event Study Plots {#sec-event-study}
+
+
 
 ## Callaway–Sant'Anna Event Study
 
@@ -930,6 +1065,7 @@ ggplot(es_data, aes(event_time, att, colour = group, fill = group)) +
 
 ggsave(dout("fig4_cs_event_study_encore.png"), width = 10, height = 6, dpi = 150)
 ```
+
 
 ```{r event-cohort-cases}
 
@@ -1106,6 +1242,7 @@ ggsave(dout("fig_event_cohort_cases.png"),
        width = 12, height = 5, dpi = 300)
 ```
 
+
 ```{r event-cohort-cases-encore}
 #| label: event-cohort-cases-encore
 #| fig-cap: "Event study by cohort × log SMA cases, split by ENCORE exposure. Each row is a cohort, each column is High/Low ENCORE."
@@ -1197,6 +1334,9 @@ ggsave(dout("fig_event_cohort_cases_encore.png"),
 
 ```
 
+
+
+
 ## ATT(g, t) by Treatment Cohort
 
 ```{r event-cohort}
@@ -1251,7 +1391,7 @@ ggplot(att_gt_df, aes(t, att)) +
 ggsave(dout("fig5_att_gt_cohorts.png"), width = 10, height = 5, dpi = 150)
 ```
 
-------------------------------------------------------------------------
+---
 
 # Heterogeneity Analysis {#sec-heterogeneity}
 
@@ -1314,6 +1454,8 @@ ggplot(het_data, aes(cohort, att, colour = group)) +
 ggsave(dout("fig6_het_cohort_encore.png"), width = 8, height = 5, dpi = 150)
 ```
 
+
+
 ## Summary Comparison Table
 
 ```{r comparison}
@@ -1349,7 +1491,7 @@ comp |>
   tab_footnote("CS uses doubly-robust method with not-yet-treated controls.")
 ```
 
-------------------------------------------------------------------------
+---
 
 # Conclusion {#sec-conclusion}
 
@@ -1357,12 +1499,12 @@ This document replicates the TWFE analysis of Ossandon Busch et al. (2025) and e
 
 **Main takeaways:**
 
-1.  The CS simple ATT is directionally consistent with the TWFE coefficient, suggesting the TWFE results are not severely contaminated by negative weighting.
-2.  **Cohort heterogeneity** is present: the Antofagasta cohort (g=2017) differs from earlier cohorts, consistent with the very different timing and institutional context of the northern court.
-3.  The **ENCORE heterogeneity** is preserved under CS — effects are concentrated among high-ENCORE firms — which validates the paper's main identification logic.
-4.  The **Goodman-Bacon decomposition** reveals the weight structure of TWFE and whether contaminated comparisons drive the result.
+1. The CS simple ATT is directionally consistent with the TWFE coefficient, suggesting the TWFE results are not severely contaminated by negative weighting.
+2. **Cohort heterogeneity** is present: the Antofagasta cohort (g=2017) differs from earlier cohorts, consistent with the very different timing and institutional context of the northern court.
+3. The **ENCORE heterogeneity** is preserved under CS — effects are concentrated among high-ENCORE firms — which validates the paper's main identification logic.
+4. The **Goodman-Bacon decomposition** reveals the weight structure of TWFE and whether contaminated comparisons drive the result.
 
-------------------------------------------------------------------------
+---
 
 # Appendix {#sec-appendix}
 
@@ -1371,18 +1513,18 @@ This document replicates the TWFE analysis of Ossandon Busch et al. (2025) and e
 Place the following `.dta` files in the `data/` folder before rendering:
 
 | File | Full path | Used in |
-|----|----|----|
+|------|-----------|---------|
 | `cmf_project_2011-2024.dta` | `C:/Users/wb631166/OneDrive - WBG/Desktop/CEMLA/CMF/Data/Base Final/` | §1.1 |
 | `cmf_project_super_intendencia.dta` | `C:/Users/wb631166/OneDrive - WBG/Desktop/CEMLA/CMF/Data/` | §1.2 |
 | `super_IDs.dta` | `C:/Users/wb631166/OneDrive - WBG/Desktop/CEMLA/CMF/Data/` | §1.3 |
 
 All outputs (figures, processed datasets) are saved to `C:/WBG/GitHub/CMF/Data/out/`.
 
-:   Required data files {tbl-colwidths="\[35, 45, 20\]"}
+: Required data files {tbl-colwidths="[35, 45, 20]"}
 
 ## Required R Packages
 
-``` r
+```r
 install.packages(c(
   "haven", "tidyverse", "fixest", "did",
   "bacondecomp", "modelsummary", "kableExtra",
